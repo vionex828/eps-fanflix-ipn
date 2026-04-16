@@ -5,9 +5,9 @@ const app = express();
 app.use(express.json());
 
 // ─── CONFIG (Railway environment variables থেকে আসবে) ───
-const EPS_SECRET_KEY = process.env.FMUNISHOY2lWZXDH4600FanFlix;   // EPS dashboard থেকে
-const TELEGRAM_BOT_TOKEN = process.env.8677029895:AAGMnkomWY0K2y51WyaZBNRzodcEJbn6IE8;
-const TELEGRAM_CHAT_ID = process.env.-1002242163455;
+const EPS_SECRET_KEY = process.env.EPS_SECRET_KEY;   // EPS dashboard থেকে
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 3000;
 
 // ─── Duplicate prevention ───
