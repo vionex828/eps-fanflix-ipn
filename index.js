@@ -1,6 +1,6 @@
 const express = require('express');
-
 const app = express();
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -32,7 +32,9 @@ app.get('/test', async (req, res) => {
 });
 
 app.post('/ipn', async (req, res) => {
-  console.log('IPN received:', JSON.stringify(req.body));
+  console.log('=== EPS IPN HIT ===');
+  console.log('Headers:', JSON.stringify(req.headers));
+  console.log('Body:', JSON.stringify(req.body));
 
   try {
     const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
