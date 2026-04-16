@@ -8,34 +8,48 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 app.get('/', (req, res) => {
-  res.send('EPS Telegram Bot is running');
+  res.send('Bot is running');
 });
 
-async function sendTelegramMessage(text) {
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text
-    })
-  });
+app.get('/test', async (req, res) => {
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: 'Test message from Railway'
+      })
+    });
 
-  const result = await response.json();
-  console.log('Telegram response:', result);
-  return result;
-}
+    const result = await response.json();
+    console.log('Telegram test result:', result);
+    res.send('Test sent');
+  } catch (error) {
+    console.error('Test failed:', error);
+    res.status(500).send('Test failed');
+  }
+});
 
 app.post('/ipn', async (req, res) => {
   console.log('IPN received:', JSON.stringify(req.body));
 
   try {
-    await sendTelegramMessage(`New IPN received:\n${JSON.stringify(req.body)}`);
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: `New IPN received:\n${JSON.stringify(req.body)}`
+      })
+    });
+
+    const result = await response.json();
+    console.log('Telegram response:', result);
+
     return res.status(200).send('OK');
   } catch (error) {
-    console.error('Telegram send error:', error.message);
+    console.error('Telegram send error:', error);
     return res.status(500).send('Telegram failed');
   }
 });
