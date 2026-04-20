@@ -51,30 +51,27 @@ app.post('/eps-ipn', async (req, res) => {
         const { Data } = req.body;
         if (!Data) return res.status(400).json({ status: 'ERROR', message: 'No data' });
 
-        const p = decryptEPS(Data);
-
-        // 🔍 LOG RAW FIELDS — so we can see exact field names from EPS
-        console.log('[IPN RAW]', JSON.stringify(p));
-
-        const icon = p.status === 'SUCCESS' ? '✅' : '❌';
+        const p    = decryptEPS(Data);
+        const icon = p.status === 'Success' ? '✅' : '❌';
 
         const msg = `${icon} <b>New Payment — FanFlix</b>
 ━━━━━━━━━━━━━━━━━━
-👤 <b>Name:</b> ${p.customer_name || 'N/A'}
-📱 <b>Phone:</b> ${p.customer_phone || 'N/A'}
-📧 <b>Email:</b> ${p.customer_email || 'N/A'}
+👤 <b>Name:</b> ${p.customerName || 'N/A'}
+📱 <b>Phone:</b> ${p.customerPhone || 'N/A'}
+📧 <b>Email:</b> ${p.customerEmail || 'N/A'}
+📍 <b>Address:</b> ${p.customerAddress || 'N/A'}
 ━━━━━━━━━━━━━━━━━━
-💰 <b>Amount:</b> ৳${p.amount}
-🏪 <b>Store Amount:</b> ৳${p.store_amount}
-💳 <b>Method:</b> ${p.payment_method || 'N/A'}
+💰 <b>Amount:</b> ৳${p.totalAmount}
+🏪 <b>Store Amount:</b> ৳${p.storeAmount}
+💳 <b>Method:</b> ${p.financialEntity || 'N/A'}
 📋 <b>Status:</b> ${p.status}
 ━━━━━━━━━━━━━━━━━━
-🆔 <b>EPS TXN:</b> ${p.transaction_id}
-🔖 <b>Order ID:</b> ${p.merchant_transaction_id}
-🕐 <b>Time:</b> ${p.timestamp}`;
+🆔 <b>EPS TXN:</b> ${p.epsTransactionId}
+🔖 <b>Order ID:</b> ${p.merchantTransactionId}
+🕐 <b>Time:</b> ${p.transactionDate}`;
 
         await sendTelegram(msg);
-        console.log(`[IPN] ${p.status} | ৳${p.amount} | ${p.customer_name}`);
+        console.log(`[IPN] ${p.status} | ৳${p.totalAmount} | ${p.customerName}`);
         res.json({ status: 'OK', message: 'IPN received and saved successfully' });
 
     } catch (err) {
