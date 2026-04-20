@@ -1,36 +1,48 @@
 const express = require('express');
 const crypto = require('crypto');
-const axios = require('axios');
+const https = require('https');
 
 const app = express();
 app.use(express.json());
 
-// ── Config from environment variables ──────────────────────
-const EPS_SECRET_KEY    = process.env.EPS_SECRET_KEY;
+const EPS_SECRET_KEY     = process.env.EPS_SECRET_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 // ── Decrypt EPS AES-256-CBC payload ────────────────────────
 function decryptEPS(data) {
     const [ivBase64, cipherBase64] = data.split(':');
     const iv         = Buffer.from(ivBase64, 'base64');
     const cipherText = Buffer.from(cipherBase64, 'base64');
-
-    // Build 32-byte key from secret key
-    const key = Buffer.alloc(32);
+    const key        = Buffer.alloc(32);
     Buffer.from(EPS_SECRET_KEY, 'utf8').copy(key);
-
-    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()]);
+    const decipher   = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    const decrypted  = Buffer.concat([decipher.update(cipherText), decipher.final()]);
     return JSON.parse(decrypted.toString('utf8'));
 }
 
-// ── Send Telegram message ───────────────────────────────────
-async function sendTelegram(text) {
-    await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }
-    );
+// ── Send Telegram using built-in https ─────────────────────
+function sendTelegram(text) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' });
+        const options = {
+            hostname: 'api.telegram.org',
+            path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body)
+            }
+        };
+        const req = https.request(options, (res) => {
+            let d = '';
+            res.on('data', chunk => d += chunk);
+            res.on('end', () => resolve(JSON.parse(d)));
+        });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
 }
 
 // ── IPN Endpoint ────────────────────────────────────────────
@@ -39,12 +51,10 @@ app.post('/eps-ipn', async (req, res) => {
         const { Data } = req.body;
         if (!Data) return res.status(400).json({ status: 'ERROR', message: 'No data' });
 
-        const p = decryptEPS(Data);
-
+        const p    = decryptEPS(Data);
         const icon = p.status === 'SUCCESS' ? '✅' : '❌';
 
-        const msg = `
-${icon} <b>New Payment — FanFlix</b>
+        const msg = `${icon} <b>New Payment — FanFlix</b>
 ━━━━━━━━━━━━━━━━━━
 👤 <b>Name:</b> ${p.customer_name || 'N/A'}
 📱 <b>Phone:</b> ${p.customer_phone || 'N/A'}
@@ -57,11 +67,9 @@ ${icon} <b>New Payment — FanFlix</b>
 ━━━━━━━━━━━━━━━━━━
 🆔 <b>EPS TXN:</b> ${p.transaction_id}
 🔖 <b>Order ID:</b> ${p.merchant_transaction_id}
-🕐 <b>Time:</b> ${p.timestamp}
-`.trim();
+🕐 <b>Time:</b> ${p.timestamp}`;
 
         await sendTelegram(msg);
-
         console.log(`[IPN] ${p.status} | ৳${p.amount} | ${p.customer_name}`);
         res.json({ status: 'OK', message: 'IPN received and saved successfully' });
 
@@ -72,9 +80,7 @@ ${icon} <b>New Payment — FanFlix</b>
 });
 
 // ── Health check ────────────────────────────────────────────
-app.get('/', (req, res) => {
-    res.send('✅ FanFlix EPS IPN Server is Running');
-});
+app.get('/', (req, res) => res.send('✅ FanFlix EPS IPN Server is Running'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
