@@ -51,7 +51,11 @@ app.post('/eps-ipn', async (req, res) => {
         const { Data } = req.body;
         if (!Data) return res.status(400).json({ status: 'ERROR', message: 'No data' });
 
-        const p    = decryptEPS(Data);
+        const p = decryptEPS(Data);
+
+        // 🔍 LOG RAW FIELDS — so we can see exact field names from EPS
+        console.log('[IPN RAW]', JSON.stringify(p));
+
         const icon = p.status === 'SUCCESS' ? '✅' : '❌';
 
         const msg = `${icon} <b>New Payment — FanFlix</b>
