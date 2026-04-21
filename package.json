@@ -1,0 +1,16 @@
+{
+  "name": "fanflix-bot",
+  "version": "2.0.0",
+  "description": "FanFlix Customer Management Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "express": "^4.18.2",
+    "better-sqlite3": "^9.4.3",
+    "node-cron": "^3.0.3",
+    "axios": "^1.6.7"
+  }
+}

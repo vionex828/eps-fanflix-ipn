@@ -1,60 +1,48 @@
-# EPS IPN → Telegram Bot
+# FanFlix Bot v2.0 — Setup Guide
 
-পেমেন্ট হলে সাথে সাথে Telegram-এ notification পাবেন।
+## Step 1 — Telegram Bot
+1. Open @BotFather → /newbot → copy Token
+2. Open @userinfobot → /start → copy your Chat ID
 
------
+## Step 2 — Shopify Admin Token
+Settings → Apps → Develop apps → Create app
+Enable: read_orders, write_orders → Install → copy token
 
-## ধাপ ১ — Telegram Bot তৈরি করুন
+## Step 3 — BulkSMSBD
+Login → API section → copy API Key + Sender ID
 
-1. Telegram-এ @BotFather খুলুন
-1. /newbot টাইপ করুন
-1. Bot-এর নাম দিন (যেমন: My EPS Bot)
-1. Bot Token কপি করুন → এটাই TELEGRAM_BOT_TOKEN
-1. এরপর আপনার bot-কে একটা chat/group-এ add করুন
-1. Chat ID পেতে: https://api.telegram.org/bot<TOKEN>/getUpdates — এখান থেকে chat.id নিন → এটাই TELEGRAM_CHAT_ID
+## Step 4 — Fill config.js or Railway Environment Variables
+```
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+EPS_SECRET_KEY
+SHOPIFY_STORE      → fanflixbd.myshopify.com
+SHOPIFY_TOKEN
+SMS_API_KEY
+SMS_SENDER_ID
+```
 
------
+## Step 5 — Deploy to Railway
+1. Upload to GitHub
+2. railway.app → New Project → Deploy from GitHub
+3. Add environment variables in Railway settings
+4. Copy your Railway URL
 
-## ধাপ ২ — Railway-তে Deploy করুন
+## Step 6 — Set EPS IPN URL
+In EPS dashboard → IPN URL:
+https://your-railway-url.up.railway.app/eps-ipn
 
-1. https://railway.app — GitHub দিয়ে sign up
-1. New Project → Deploy from GitHub repo
-1. এই ফোল্ডারটা GitHub-এ upload করুন (বা Railway CLI ব্যবহার করুন)
-1. Deploy হলে Settings → Environment Variables এ যান
+## Step 7 — Set Shopify Webhook (for follow-up)
+Shopify Admin → Settings → Notifications → Webhooks
+Event: Order creation
+URL: https://your-railway-url.up.railway.app/shopify-order
 
-নিচের তিনটা variable যোগ করুন:
-EPS_SECRET_KEY      = (EPS dashboard থেকে আপনার secret key)
-TELEGRAM_BOT_TOKEN  = (BotFather থেকে পাওয়া token)
-TELEGRAM_CHAT_ID    = (আপনার chat/group এর ID)
+## Step 8 — Test
+Make a test payment → Telegram alert should arrive instantly ✅
 
-1. Railway আপনাকে একটা URL দেবে, যেমন:
-   https://eps-ipn-bot.up.railway.app
+---
 
------
-
-## ধাপ ৩ — EPS Dashboard-এ IPN URL দিন
-
-আপনার EPS Merchant Dashboard-এ লগইন করুন।
-IPN URL হিসেবে দিন:
-https://eps-ipn-bot.up.railway.app/ipn
-
------
-
-## Notification দেখতে এরকম হবে
-✅ নতুন পেমেন্ট সফল
-
-🔖 Transaction ID: EPS123456789
-🛒 Order ID: ORDER-001
-💰 Amount: ৳1,500.00
-📱 Payment Method: bKash
-👤 Customer: John Doe
-📞 Phone: +8801234567890
-🕐 Time: ৬ এপ্রিল ২০২৫, রাত ৮:৩০
-
------
-
-## সমস্যা হলে
-
-- Railway logs চেক করুন (Deploy → View Logs)
-- EPS Secret Key সঠিক আছে কিনা নিশ্চিত করুন
-- Telegram Bot আপনার chat-এ add আছে কিনা দেখুন
+## Commands
+/start /customers /expiring /today /revenue /stats
+/product /retention /top /pending /search /add /edit
+/delete /export /setmsg3 /setmsg1 /setwinback /setfollowup
