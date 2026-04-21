@@ -1,6 +1,6 @@
 // =============================================
-//   FANFLIX BOT v2.0
-//   Complete Customer Management System
+//   FANFLIX BOT v2.1
+//   No Shopify API needed - uses webhooks only
 // =============================================
 
 const express     = require('express');
@@ -51,16 +51,18 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS pending_orders (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
     shopify_order_id TEXT UNIQUE,
-    order_name      TEXT,
-    name            TEXT,
-    phone           TEXT,
-    email           TEXT,
-    product         TEXT,
-    amount          REAL,
-    followup_sent   INTEGER DEFAULT 0,
-    created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+    order_name       TEXT,
+    name             TEXT,
+    phone            TEXT,
+    email            TEXT,
+    product          TEXT,
+    variant          TEXT,
+    amount           REAL,
+    followup_sent    INTEGER DEFAULT 0,
+    paid             INTEGER DEFAULT 0,
+    created_at       TEXT DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS settings (
@@ -70,22 +72,20 @@ db.exec(`
 `);
 
 // Default SMS messages
-const defaultSettings = {
-  msg3:      'FanFlix: আপনার {product} subscription ৩ দিন পর শেষ হবে। Renew করুন: fanflixbd.com',
-  msg1:      'FanFlix: আপনার {product} subscription আগামীকাল শেষ হবে! এখনই renew করুন: fanflixbd.com',
-  winback:   'FanFlix: আপনাকে miss করছি! আজই ফিরে আসুন: fanflixbd.com',
-  followup:  'FanFlix: আপনার order টি pending আছে! Payment করুন: {link}',
+const defaults = {
+  msg3:     'FanFlix: আপনার {product} subscription ৩ দিন পর শেষ হবে। Renew করুন: fanflixbd.com',
+  msg1:     'FanFlix: আপনার {product} subscription আগামীকাল শেষ হবে! Renew করুন: fanflixbd.com',
+  winback:  'FanFlix: আপনাকে miss করছি! আজই ফিরে আসুন: fanflixbd.com',
+  followup: 'FanFlix: আপনার order টি pending আছে! Payment করুন: {link}',
 };
-
-Object.entries(defaultSettings).forEach(([key, value]) => {
-  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run(key, value);
+Object.entries(defaults).forEach(([k, v]) => {
+  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run(k, v);
 });
 
 function getSetting(key) {
   const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
   return row ? row.value : '';
 }
-
 function setSetting(key, value) {
   db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(key, value);
 }
@@ -100,7 +100,6 @@ const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 function sendTelegram(message) {
   return bot.sendMessage(config.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
 }
-
 function isOwner(msg) {
   return String(msg.chat.id) === String(config.TELEGRAM_CHAT_ID);
 }
@@ -135,7 +134,7 @@ function parseDuration(text = '') {
   if (t.includes('3 month')) return 90;
   if (t.includes('2 month')) return 60;
   if (t.includes('1 month')) return 30;
-  if (t.includes('7 day')   || t.includes('1 week'))  return 7;
+  if (t.includes('7 day') || t.includes('1 week')) return 7;
   return 30;
 }
 
@@ -170,36 +169,6 @@ function formatSMS(template, vars = {}) {
 
 
 // =============================================================
-//  SHOPIFY
-// =============================================================
-
-async function getUnpaidOrders() {
-  const { data } = await axios.get(
-    `https://${config.SHOPIFY_STORE}/admin/api/2024-01/orders.json?status=open&financial_status=pending&limit=100`,
-    { headers: { 'X-Shopify-Access-Token': config.SHOPIFY_TOKEN } }
-  );
-  return data.orders || [];
-}
-
-async function findShopifyOrder(phone) {
-  const local  = normalizePhone(phone);
-  const orders = await getUnpaidOrders();
-  return orders.find(o => {
-    const p = normalizePhone(o.phone || o.billing_address?.phone || '');
-    return p === local;
-  }) || null;
-}
-
-async function markShopifyPaid(orderId, amount) {
-  await axios.post(
-    `https://${config.SHOPIFY_STORE}/admin/api/2024-01/orders/${orderId}/transactions.json`,
-    { transaction: { kind: 'capture', status: 'success', amount: String(amount) } },
-    { headers: { 'X-Shopify-Access-Token': config.SHOPIFY_TOKEN, 'Content-Type': 'application/json' } }
-  );
-}
-
-
-// =============================================================
 //  SMS
 // =============================================================
 
@@ -212,11 +181,64 @@ async function sendSMS(phone, message) {
 
 
 // =============================================================
-//  EPS IPN
+//  EXPRESS
 // =============================================================
 
 const app = express();
 app.use(express.json());
+
+
+// =============================================================
+//  SHOPIFY WEBHOOK - receives order data (no API token needed!)
+// =============================================================
+
+app.post('/shopify-order', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const order  = req.body;
+    const phone  = normalizePhone(order.phone || order.billing_address?.phone || '');
+    const name   = order.billing_address?.name || order.customer?.first_name || 'Customer';
+    const email  = order.email || '';
+    const amount = parseFloat(order.total_price || 0);
+    const lineItem = order.line_items?.[0] || {};
+    const product  = lineItem.name || 'Unknown Product';
+    const variant  = lineItem.variant_title || '';
+
+    if (!phone) return;
+
+    // Save to pending orders
+    db.prepare(`
+      INSERT OR IGNORE INTO pending_orders
+        (shopify_order_id, order_name, name, phone, email, product, variant, amount)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(String(order.id), order.name, name, phone, email, product, variant, amount);
+
+    // Schedule follow-up SMS after 1 hour if not paid
+    setTimeout(async () => {
+      const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(order.id));
+      if (!pending || pending.paid === 1 || pending.followup_sent === 1) return;
+
+      try {
+        const smsText = formatSMS(getSetting('followup'), { link: config.EPS_PAYMENT_LINK });
+        await sendSMS(phone, smsText);
+        db.prepare('UPDATE pending_orders SET followup_sent = 1 WHERE shopify_order_id = ?').run(String(order.id));
+        await sendTelegram(
+          `⏰ *Follow-up SMS Sent!*\n` +
+          `👤 Name: ${name}\n📱 Phone: 0${phone}\n` +
+          `🛒 Order: ${order.name}\n📦 Product: ${product}\n💰 Amount: ৳${amount}`
+        );
+      } catch(e) { console.error('Followup SMS error:', e.message); }
+    }, config.FOLLOW_UP_DELAY_MS);
+
+  } catch (err) {
+    console.error('Shopify webhook error:', err.message);
+  }
+});
+
+
+// =============================================================
+//  EPS IPN - receives payment
+// =============================================================
 
 app.post('/eps-ipn', async (req, res) => {
   res.json({ status: 'OK', message: 'IPN received' });
@@ -255,43 +277,50 @@ app.post('/eps-ipn', async (req, res) => {
     db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, status) VALUES (?, ?, ?, ?)')
       .run(epsTxnId, normalizePhone(phone), amount, p.status);
 
-    // Find Shopify order
-    const order = await findShopifyOrder(phone);
-    if (!order) {
+    // Find matching pending order from Shopify webhook
+    const pendingOrder = db.prepare(`
+      SELECT * FROM pending_orders WHERE phone = ? AND paid = 0
+      ORDER BY created_at DESC LIMIT 1
+    `).get(normalizePhone(phone));
+
+    if (!pendingOrder) {
+      // No order found — still notify you
       await sendTelegram(
-        `⚠️ *No Shopify Order Found!*\n` +
-        `👤 Name: ${name}\n📱 Phone: ${phone}\n💰 Amount: ৳${amount}\n🆔 TXN: ${epsTxnId}`
+        `⚠️ *Payment received but no order found!*\n` +
+        `👤 Name: ${name}\n📱 Phone: ${phone}\n` +
+        `💰 Amount: ৳${amount}\n🆔 TXN: ${epsTxnId}\n` +
+        `_Customer may not have placed Shopify order_`
       );
       return;
     }
 
-    const lineItem     = order.line_items?.[0] || {};
-    const product      = lineItem.name || 'Unknown Product';
-    const variant      = lineItem.variant_title || '';
+    // Mark order as paid
+    db.prepare('UPDATE pending_orders SET paid = 1 WHERE id = ?').run(pendingOrder.id);
+
+    const product      = pendingOrder.product;
+    const variant      = pendingOrder.variant;
     const durationDays = parseDuration(variant || product);
     const startDate    = today();
     const expiryDate   = addDays(durationDays);
 
-    // Check if existing customer (renewal)
+    // Check renewal count
     const existing = db.prepare('SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1')
       .get(normalizePhone(phone));
-
     const renewalCount = existing ? existing.renewal_count + 1 : 1;
     const isVip        = renewalCount >= config.VIP_RENEWAL_COUNT ? 1 : 0;
-
-    // Mark Shopify paid
-    await markShopifyPaid(order.id, amount);
-
-    // Mark pending order as paid (cancel follow-up)
-    db.prepare('UPDATE pending_orders SET followup_sent = 2 WHERE shopify_order_id = ?')
-      .run(String(order.id));
 
     // Save customer
     db.prepare(`
       INSERT INTO customers
         (name, phone, email, product, variant, order_id, order_name, amount, duration_days, start_date, expiry_date, renewal_count, is_vip)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(name, normalizePhone(phone), email, product, variant, String(order.id), order.name, amount, durationDays, startDate, expiryDate, renewalCount, isVip);
+    `).run(
+      name, normalizePhone(phone), email,
+      product, variant,
+      pendingOrder.shopify_order_id, pendingOrder.order_name,
+      amount, durationDays, startDate, expiryDate,
+      renewalCount, isVip
+    );
 
     // Build Telegram alert
     let alert =
@@ -300,7 +329,7 @@ app.post('/eps-ipn', async (req, res) => {
       `👤 Name: ${name}\n` +
       `📱 Phone: ${phone}\n` +
       `📧 Email: ${email || 'N/A'}\n` +
-      `🛒 Order: ${order.name}\n` +
+      `🛒 Order: ${pendingOrder.order_name}\n` +
       `📦 Product: ${product}${variant ? ` — ${variant}` : ''}\n` +
       `💰 Amount: ৳${amount}\n` +
       `📅 Expires: ${formatDate(expiryDate)}\n`;
@@ -317,63 +346,17 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
-
-// =============================================================
-//  SHOPIFY WEBHOOK - New Order (for follow-up tracking)
-// =============================================================
-
-app.post('/shopify-order', async (req, res) => {
-  res.sendStatus(200);
-  try {
-    const order   = req.body;
-    const phone   = normalizePhone(order.phone || order.billing_address?.phone || '');
-    const name    = order.billing_address?.name || order.email || 'Customer';
-    const email   = order.email || '';
-    const amount  = parseFloat(order.total_price || 0);
-    const product = order.line_items?.[0]?.name || 'Unknown';
-
-    if (!phone) return;
-
-    // Save to pending orders
-    db.prepare(`
-      INSERT OR IGNORE INTO pending_orders (shopify_order_id, order_name, name, phone, email, product, amount)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(String(order.id), order.name, name, phone, email, product, amount);
-
-    // Schedule follow-up after 1 hour
-    setTimeout(async () => {
-      const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(order.id));
-      if (!pending || pending.followup_sent !== 0) return; // already paid or sent
-
-      const smsText = formatSMS(getSetting('followup'), { link: config.EPS_PAYMENT_LINK });
-      await sendSMS(phone, smsText);
-
-      db.prepare('UPDATE pending_orders SET followup_sent = 1 WHERE shopify_order_id = ?').run(String(order.id));
-
-      await sendTelegram(
-        `⏰ *Follow-up SMS Sent!*\n` +
-        `👤 Name: ${name}\n📱 Phone: 0${phone}\n` +
-        `🛒 Order: ${order.name}\n📦 Product: ${product}\n💰 Amount: ৳${amount}`
-      );
-    }, config.FOLLOW_UP_DELAY_MS);
-
-  } catch (err) {
-    console.error('Shopify webhook error:', err.message);
-  }
-});
-
-app.get('/', (req, res) => res.send('✅ FanFlix Bot v2.0 Running'));
+app.get('/', (req, res) => res.send('✅ FanFlix Bot v2.1 Running'));
 
 
 // =============================================================
 //  BOT COMMANDS
 // =============================================================
 
-// /start
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   bot.sendMessage(msg.chat.id,
-    `👋 *FanFlix Bot v2.0*\n\n` +
+    `👋 *FanFlix Bot v2.1*\n\n` +
     `📋 *Commands:*\n` +
     `/customers — Active customers\n` +
     `/expiring — Expiring this week\n` +
@@ -398,20 +381,17 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
-// /customers
 bot.onText(/\/customers/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') ORDER BY expiry_date ASC LIMIT 20`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No active customers.');
   let text = `👥 *Active Customers (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach(c => {
-    const d = daysUntil(c.expiry_date);
-    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} (${d}d left)\n\n`;
+    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} (${daysUntil(c.expiry_date)}d left)\n\n`;
   });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /expiring
 bot.onText(/\/expiring/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days') ORDER BY expiry_date ASC`).all();
@@ -423,21 +403,17 @@ bot.onText(/\/expiring/, (msg) => {
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /today
 bot.onText(/\/today/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers WHERE start_date = date('now') ORDER BY created_at DESC`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No orders today.');
   const total = rows.reduce((s, c) => s + c.amount, 0);
   let text = `📅 *Today's Orders (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => {
-    text += `${i + 1}. ${c.name} — ${c.product} — ৳${c.amount}\n`;
-  });
+  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} — ${c.product} — ৳${c.amount}\n`; });
   text += `━━━━━━━━━━━━━━━━━━\n💰 Total: ৳${total}`;
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /revenue
 bot.onText(/\/revenue/, (msg) => {
   if (!isOwner(msg)) return;
   const t = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = date('now')`).get();
@@ -452,17 +428,16 @@ bot.onText(/\/revenue/, (msg) => {
   );
 });
 
-// /stats
 bot.onText(/\/stats/, (msg) => {
   if (!isOwner(msg)) return;
-  const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
-  const expired  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date < date('now')`).get();
-  const total    = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM customers`).get();
-  const vip      = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE is_vip = 1 AND expiry_date >= date('now')`).get();
-  const best     = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers GROUP BY product ORDER BY cnt DESC LIMIT 1`).get();
+  const active  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
+  const expired = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date < date('now')`).get();
+  const total   = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM customers`).get();
+  const vip     = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE is_vip = 1 AND expiry_date >= date('now')`).get();
+  const best    = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers GROUP BY product ORDER BY cnt DESC LIMIT 1`).get();
   bot.sendMessage(msg.chat.id,
     `📊 *Business Overview*\n━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Total Customers: ${active.cnt + expired.cnt}\n` +
+    `👥 Total: ${active.cnt + expired.cnt}\n` +
     `✅ Active: ${active.cnt}\n` +
     `❌ Expired: ${expired.cnt}\n` +
     `⭐ VIP: ${vip.cnt}\n` +
@@ -472,241 +447,173 @@ bot.onText(/\/stats/, (msg) => {
   );
 });
 
-// /product
 bot.onText(/\/product/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT product, COUNT(*) AS cnt, SUM(amount) AS revenue FROM customers GROUP BY product ORDER BY cnt DESC`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
   let text = `📦 *Sales by Product*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach(r => {
-    text += `📦 ${r.product}\n👥 ${r.cnt} customers | 💰 ৳${r.revenue}\n\n`;
-  });
+  rows.forEach(r => { text += `📦 ${r.product}\n👥 ${r.cnt} | 💰 ৳${r.revenue}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /retention
 bot.onText(/\/retention/, (msg) => {
   if (!isOwner(msg)) return;
-  const total    = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers`).get();
-  const renewed  = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers WHERE renewal_count > 1`).get();
-  const rate     = total.cnt > 0 ? Math.round((renewed.cnt / total.cnt) * 100) : 0;
-  const topLoyal = db.prepare(`SELECT name, phone, MAX(renewal_count) AS renewals FROM customers GROUP BY phone ORDER BY renewals DESC LIMIT 5`).all();
+  const total   = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers`).get();
+  const renewed = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers WHERE renewal_count > 1`).get();
+  const rate    = total.cnt > 0 ? Math.round((renewed.cnt / total.cnt) * 100) : 0;
+  const top     = db.prepare(`SELECT name, phone, MAX(renewal_count) AS renewals FROM customers GROUP BY phone ORDER BY renewals DESC LIMIT 5`).all();
   let text = `📊 *Retention Report*\n━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Total Customers: ${total.cnt}\n` +
-    `🔄 Renewed: ${renewed.cnt}\n` +
-    `📈 Retention Rate: ${rate}%\n\n` +
-    `⭐ *Most Loyal:*\n`;
-  topLoyal.forEach((c, i) => {
-    text += `${i + 1}. ${c.name} — ${c.renewals} renewals\n`;
-  });
+    `👥 Total: ${total.cnt}\n🔄 Renewed: ${renewed.cnt}\n📈 Rate: ${rate}%\n\n⭐ *Most Loyal:*\n`;
+  top.forEach((c, i) => { text += `${i + 1}. ${c.name} — ${c.renewals} renewals\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /top
 bot.onText(/\/top/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS renewals, SUM(amount) AS spent FROM customers GROUP BY phone ORDER BY renewals DESC LIMIT 10`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
   let text = `🏆 *Top Customers*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => {
-    text += `${i + 1}. ${c.name} | 📱 0${c.phone}\n🔄 ${c.renewals} renewals | 💰 ৳${c.spent}\n\n`;
-  });
+  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} | 📱 0${c.phone}\n🔄 ${c.renewals} renewals | 💰 ৳${c.spent}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /pending
 bot.onText(/\/pending/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT * FROM payments WHERE eps_txn_id NOT IN (SELECT eps_txn_id FROM payments WHERE eps_txn_id IN (SELECT order_id FROM customers)) ORDER BY created_at DESC LIMIT 10`).all();
-  // Simpler: just show unmatched payments from last 24h
-  const unmatched = db.prepare(`
-    SELECT p.* FROM payments p
-    WHERE p.created_at >= datetime('now', '-24 hours')
-    AND p.phone NOT IN (SELECT phone FROM customers WHERE start_date = date('now'))
+  const rows = db.prepare(`
+    SELECT * FROM payments WHERE created_at >= datetime('now', '-24 hours')
+    AND phone NOT IN (SELECT phone FROM customers WHERE start_date = date('now'))
   `).all();
-  if (!unmatched.length) return bot.sendMessage(msg.chat.id, '✅ No unmatched payments!');
+  if (!rows.length) return bot.sendMessage(msg.chat.id, '✅ No unmatched payments!');
   let text = `⚠️ *Unmatched Payments*\n━━━━━━━━━━━━━━━━━━\n`;
-  unmatched.forEach(p => {
-    text += `📱 0${p.phone} | 💰 ৳${p.amount}\n🆔 ${p.eps_txn_id}\n\n`;
-  });
+  rows.forEach(p => { text += `📱 0${p.phone} | 💰 ৳${p.amount}\n🆔 ${p.eps_txn_id}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /search
 bot.onText(/\/search (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
   const query = match[1].trim();
-  const rows  = db.prepare(`
-    SELECT * FROM customers WHERE phone LIKE ? OR name LIKE ? ORDER BY created_at DESC LIMIT 10
-  `).all(`%${normalizePhone(query)}%`, `%${query}%`);
+  const rows  = db.prepare(`SELECT * FROM customers WHERE phone LIKE ? OR name LIKE ? ORDER BY created_at DESC LIMIT 10`)
+    .all(`%${normalizePhone(query)}%`, `%${query}%`);
   if (!rows.length) return bot.sendMessage(msg.chat.id, '🔍 No customer found.');
-  let text = `🔍 *Search: "${query}"*\n━━━━━━━━━━━━━━━━━━\n`;
+  let text = `🔍 *"${query}"*\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach(c => {
     const d = daysUntil(c.expiry_date);
-    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} | ${d > 0 ? `✅ Active (${d}d)` : '❌ Expired'}\n🛒 ${c.order_name} | 💰 ৳${c.amount} | 🔄 #${c.renewal_count}\n\n`;
+    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} | ${d > 0 ? `✅ Active (${d}d)` : '❌ Expired'}\n🔄 Renewal #${c.renewal_count} | 💰 ৳${c.amount}\n\n`;
   });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /export
 bot.onText(/\/export/, async (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers ORDER BY created_at DESC`).all();
-  if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data to export.');
-  let csv = 'Name,Phone,Email,Product,Amount,Start Date,Expiry Date,Renewals,VIP\n';
+  if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
+  let csv = 'Name,Phone,Email,Product,Amount,Start,Expiry,Renewals,VIP\n';
   rows.forEach(c => {
     csv += `"${c.name}","0${c.phone}","${c.email}","${c.product}",${c.amount},${c.start_date},${c.expiry_date},${c.renewal_count},${c.is_vip ? 'Yes' : 'No'}\n`;
   });
-  const buf = Buffer.from(csv, 'utf8');
-  bot.sendDocument(msg.chat.id, buf, {}, { filename: `fanflix_customers_${today()}.csv`, contentType: 'text/csv' });
+  bot.sendDocument(msg.chat.id, Buffer.from(csv, 'utf8'), {}, { filename: `fanflix_${today()}.csv`, contentType: 'text/csv' });
 });
 
-// /add — multi-step
+// /add multi-step
 const addState = {};
-
 bot.onText(/\/add/, (msg) => {
   if (!isOwner(msg)) return;
   addState[msg.chat.id] = { step: 'name' };
   bot.sendMessage(msg.chat.id, '👤 Enter customer *name*:', { parse_mode: 'Markdown' });
 });
 
-// /edit
+// /edit multi-step
 const editState = {};
-
 bot.onText(/\/edit/, (msg) => {
   if (!isOwner(msg)) return;
   editState[msg.chat.id] = { step: 'phone' };
-  bot.sendMessage(msg.chat.id, '📱 Enter customer *phone number* to edit:', { parse_mode: 'Markdown' });
+  bot.sendMessage(msg.chat.id, '📱 Enter phone number to edit:', { parse_mode: 'Markdown' });
 });
 
-// /delete
+// /delete multi-step
 const deleteState = {};
-
 bot.onText(/\/delete/, (msg) => {
   if (!isOwner(msg)) return;
   deleteState[msg.chat.id] = { step: 'phone' };
-  bot.sendMessage(msg.chat.id, '📱 Enter customer *phone number* to delete:', { parse_mode: 'Markdown' });
+  bot.sendMessage(msg.chat.id, '📱 Enter phone number to delete:', { parse_mode: 'Markdown' });
 });
 
 // SMS settings
 bot.onText(/\/setmsg3/, (msg) => {
   if (!isOwner(msg)) return;
-  bot.sendMessage(msg.chat.id,
-    `Current 3-day SMS:\n_${getSetting('msg3')}_\n\nSend new message (use {product} for product name):`,
-    { parse_mode: 'Markdown' }
-  );
-  bot.once('message', (reply) => {
-    if (!isOwner(reply)) return;
-    setSetting('msg3', reply.text);
-    bot.sendMessage(reply.chat.id, '✅ 3-day reminder SMS updated!');
-  });
+  bot.sendMessage(msg.chat.id, `Current:\n_${getSetting('msg3')}_\n\nSend new message (use {product}):`, { parse_mode: 'Markdown' });
+  bot.once('message', (r) => { if (!isOwner(r)) return; setSetting('msg3', r.text); bot.sendMessage(r.chat.id, '✅ Updated!'); });
 });
-
 bot.onText(/\/setmsg1/, (msg) => {
   if (!isOwner(msg)) return;
-  bot.sendMessage(msg.chat.id,
-    `Current 1-day SMS:\n_${getSetting('msg1')}_\n\nSend new message:`,
-    { parse_mode: 'Markdown' }
-  );
-  bot.once('message', (reply) => {
-    if (!isOwner(reply)) return;
-    setSetting('msg1', reply.text);
-    bot.sendMessage(reply.chat.id, '✅ 1-day reminder SMS updated!');
-  });
+  bot.sendMessage(msg.chat.id, `Current:\n_${getSetting('msg1')}_\n\nSend new message:`, { parse_mode: 'Markdown' });
+  bot.once('message', (r) => { if (!isOwner(r)) return; setSetting('msg1', r.text); bot.sendMessage(r.chat.id, '✅ Updated!'); });
 });
-
 bot.onText(/\/setwinback/, (msg) => {
   if (!isOwner(msg)) return;
-  bot.sendMessage(msg.chat.id,
-    `Current win-back SMS:\n_${getSetting('winback')}_\n\nSend new message:`,
-    { parse_mode: 'Markdown' }
-  );
-  bot.once('message', (reply) => {
-    if (!isOwner(reply)) return;
-    setSetting('winback', reply.text);
-    bot.sendMessage(reply.chat.id, '✅ Win-back SMS updated!');
-  });
+  bot.sendMessage(msg.chat.id, `Current:\n_${getSetting('winback')}_\n\nSend new message:`, { parse_mode: 'Markdown' });
+  bot.once('message', (r) => { if (!isOwner(r)) return; setSetting('winback', r.text); bot.sendMessage(r.chat.id, '✅ Updated!'); });
 });
-
 bot.onText(/\/setfollowup/, (msg) => {
   if (!isOwner(msg)) return;
-  bot.sendMessage(msg.chat.id,
-    `Current follow-up SMS:\n_${getSetting('followup')}_\n\nSend new message (use {link} for payment link):`,
-    { parse_mode: 'Markdown' }
-  );
-  bot.once('message', (reply) => {
-    if (!isOwner(reply)) return;
-    setSetting('followup', reply.text);
-    bot.sendMessage(reply.chat.id, '✅ Follow-up SMS updated!');
-  });
+  bot.sendMessage(msg.chat.id, `Current:\n_${getSetting('followup')}_\n\nSend new message (use {link}):`, { parse_mode: 'Markdown' });
+  bot.once('message', (r) => { if (!isOwner(r)) return; setSetting('followup', r.text); bot.sendMessage(r.chat.id, '✅ Updated!'); });
 });
 
-// Handle multi-step conversations
+// Multi-step handler
 bot.on('message', (msg) => {
   if (!isOwner(msg)) return;
   const cid  = msg.chat.id;
   const text = msg.text || '';
+  if (text.startsWith('/')) return;
 
-  // ADD flow
+  // ADD
   if (addState[cid]) {
-    const state = addState[cid];
-    if (state.step === 'name') {
-      state.name = text; state.step = 'phone';
-      return bot.sendMessage(cid, '📱 Enter phone number:');
-    }
-    if (state.step === 'phone') {
-      state.phone = normalizePhone(text); state.step = 'product';
-      return bot.sendMessage(cid, '📦 Enter product name (e.g. Netflix 1 Month):');
-    }
-    if (state.step === 'product') {
-      state.product = text; state.step = 'duration';
-      return bot.sendMessage(cid, '⏳ Enter duration in days (e.g. 30):');
-    }
-    if (state.step === 'duration') {
-      const days       = parseInt(text) || 30;
-      const expiryDate = addDays(days);
-      db.prepare(`
-        INSERT INTO customers (name, phone, product, amount, duration_days, start_date, expiry_date, renewal_count)
-        VALUES (?, ?, ?, 0, ?, ?, ?, 1)
-      `).run(state.name, state.phone, state.product, days, today(), expiryDate);
+    const s = addState[cid];
+    if (s.step === 'name')     { s.name = text; s.step = 'phone'; return bot.sendMessage(cid, '📱 Enter phone:'); }
+    if (s.step === 'phone')    { s.phone = normalizePhone(text); s.step = 'product'; return bot.sendMessage(cid, '📦 Enter product (e.g. Netflix 1 Month):'); }
+    if (s.step === 'product')  { s.product = text; s.step = 'duration'; return bot.sendMessage(cid, '⏳ Enter duration in days (e.g. 30):'); }
+    if (s.step === 'duration') {
+      const days = parseInt(text) || 30;
+      const exp  = addDays(days);
+      db.prepare(`INSERT INTO customers (name, phone, product, amount, duration_days, start_date, expiry_date, renewal_count) VALUES (?, ?, ?, 0, ?, ?, ?, 1)`)
+        .run(s.name, s.phone, s.product, days, today(), exp);
       delete addState[cid];
-      return bot.sendMessage(cid, `✅ Customer added!\n👤 ${state.name}\n📦 ${state.product}\n📅 Expires: ${formatDate(expiryDate)}`);
+      return bot.sendMessage(cid, `✅ Added!\n👤 ${s.name}\n📦 ${s.product}\n📅 Expires: ${formatDate(exp)}`);
     }
   }
 
-  // EDIT flow
+  // EDIT
   if (editState[cid]) {
-    const state = editState[cid];
-    if (state.step === 'phone') {
-      const phone = normalizePhone(text);
-      const c     = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(phone);
-      if (!c) { delete editState[cid]; return bot.sendMessage(cid, '❌ Customer not found.'); }
-      state.customer = c; state.step = 'date';
-      return bot.sendMessage(cid, `Found: *${c.name}* | Current expiry: ${formatDate(c.expiry_date)}\n\nEnter new expiry date (YYYY-MM-DD):`, { parse_mode: 'Markdown' });
+    const s = editState[cid];
+    if (s.step === 'phone') {
+      const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
+      if (!c) { delete editState[cid]; return bot.sendMessage(cid, '❌ Not found.'); }
+      s.customer = c; s.step = 'date';
+      return bot.sendMessage(cid, `Found: *${c.name}*\nCurrent expiry: ${formatDate(c.expiry_date)}\n\nEnter new date (YYYY-MM-DD):`, { parse_mode: 'Markdown' });
     }
-    if (state.step === 'date') {
-      db.prepare(`UPDATE customers SET expiry_date = ?, reminder_3_sent = 0, reminder_1_sent = 0 WHERE id = ?`).run(text, state.customer.id);
+    if (s.step === 'date') {
+      db.prepare(`UPDATE customers SET expiry_date = ?, reminder_3_sent = 0, reminder_1_sent = 0 WHERE id = ?`).run(text, s.customer.id);
       delete editState[cid];
       return bot.sendMessage(cid, `✅ Expiry updated to *${formatDate(text)}*`, { parse_mode: 'Markdown' });
     }
   }
 
-  // DELETE flow
+  // DELETE
   if (deleteState[cid]) {
-    const state = deleteState[cid];
-    if (state.step === 'phone') {
-      const phone = normalizePhone(text);
-      const c     = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(phone);
-      if (!c) { delete deleteState[cid]; return bot.sendMessage(cid, '❌ Customer not found.'); }
-      state.customer = c; state.step = 'confirm';
-      return bot.sendMessage(cid, `Found: *${c.name}* | ${c.product}\n\nType *YES* to confirm delete:`, { parse_mode: 'Markdown' });
+    const s = deleteState[cid];
+    if (s.step === 'phone') {
+      const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
+      if (!c) { delete deleteState[cid]; return bot.sendMessage(cid, '❌ Not found.'); }
+      s.customer = c; s.step = 'confirm';
+      return bot.sendMessage(cid, `Found: *${c.name}* | ${c.product}\n\nType *YES* to confirm:`, { parse_mode: 'Markdown' });
     }
-    if (state.step === 'confirm') {
+    if (s.step === 'confirm') {
       if (text === 'YES') {
-        db.prepare(`DELETE FROM customers WHERE id = ?`).run(state.customer.id);
-        bot.sendMessage(cid, `✅ Customer *${state.customer.name}* deleted.`, { parse_mode: 'Markdown' });
+        db.prepare(`DELETE FROM customers WHERE id = ?`).run(s.customer.id);
+        bot.sendMessage(cid, `✅ *${s.customer.name}* deleted.`, { parse_mode: 'Markdown' });
       } else {
-        bot.sendMessage(cid, '❌ Delete cancelled.');
+        bot.sendMessage(cid, '❌ Cancelled.');
       }
       delete deleteState[cid];
     }
@@ -718,7 +625,6 @@ bot.on('message', (msg) => {
 //  SCHEDULED TASKS
 // =============================================================
 
-// 9 AM — renewal reminders + win-back
 cron.schedule('0 9 * * *', async () => {
 
   // 3-day reminder
@@ -727,8 +633,8 @@ cron.schedule('0 9 * * *', async () => {
     try {
       await sendSMS(c.phone, formatSMS(getSetting('msg3'), { product: c.product }));
       db.prepare('UPDATE customers SET reminder_3_sent = 1 WHERE id = ?').run(c.id);
-      await sendTelegram(`📩 *Renewal SMS (3 days)*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 Expires: ${formatDate(c.expiry_date)}`);
-    } catch (e) { console.error('SMS 3d:', e.message); }
+      await sendTelegram(`📩 *Renewal SMS (3 days)*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)}`);
+    } catch(e) { console.error('SMS 3d:', e.message); }
   }
 
   // 1-day reminder
@@ -737,75 +643,61 @@ cron.schedule('0 9 * * *', async () => {
     try {
       await sendSMS(c.phone, formatSMS(getSetting('msg1'), { product: c.product }));
       db.prepare('UPDATE customers SET reminder_1_sent = 1 WHERE id = ?').run(c.id);
-      await sendTelegram(`🚨 *Renewal SMS (1 day)*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 Expires: TOMORROW`);
-    } catch (e) { console.error('SMS 1d:', e.message); }
+      await sendTelegram(`🚨 *Renewal SMS (1 day)*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 TOMORROW`);
+    } catch(e) { console.error('SMS 1d:', e.message); }
   }
 
-  // Win-back (5 days after expiry)
+  // Win-back
   const winback = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','-${config.WINBACK_DAYS_AFTER_EXPIRY} days') AND winback_sent = 0`).all();
   for (const c of winback) {
     try {
       await sendSMS(c.phone, formatSMS(getSetting('winback'), { product: c.product }));
       db.prepare('UPDATE customers SET winback_sent = 1 WHERE id = ?').run(c.id);
       await sendTelegram(`🏆 *Win-back SMS Sent*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}`);
-    } catch (e) { console.error('Winback:', e.message); }
+    } catch(e) { console.error('Winback:', e.message); }
   }
 
-  // Lost customer alert (3 days after expiry)
+  // Lost customer alert
   const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','-${config.LOST_ALERT_DAYS_AFTER_EXPIRY} days') AND lost_alert_sent = 0`).all();
   for (const c of lost) {
     try {
       await sendTelegram(`⚠️ *Lost Customer!*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n💀 Expired ${config.LOST_ALERT_DAYS_AFTER_EXPIRY} days ago`);
       db.prepare('UPDATE customers SET lost_alert_sent = 1 WHERE id = ?').run(c.id);
-    } catch (e) { console.error('Lost alert:', e.message); }
+    } catch(e) { console.error('Lost:', e.message); }
   }
 });
 
-// 11 PM — daily summary + expiry by product
+// 11 PM summary
 cron.schedule('0 23 * * *', async () => {
   try {
     const t        = db.prepare(`SELECT COALESCE(SUM(amount),0) AS revenue, COUNT(*) AS orders FROM customers WHERE start_date = date('now')`).get();
     const expiring = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days')`).get();
     const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
-
     await sendTelegram(
       `📊 *Daily Summary*\n━━━━━━━━━━━━━━━━━━\n` +
-      `✅ New Orders: ${t.orders}\n` +
-      `💰 Revenue: ৳${t.revenue}\n` +
-      `👥 Active Customers: ${active.cnt}\n` +
-      `⚠️ Expiring This Week: ${expiring.cnt}`
+      `✅ New Orders: ${t.orders}\n💰 Revenue: ৳${t.revenue}\n` +
+      `👥 Active: ${active.cnt}\n⚠️ Expiring This Week: ${expiring.cnt}`
     );
-
-    // Expiry by product this month
-    const byProduct = db.prepare(`
-      SELECT product, COUNT(*) AS cnt FROM customers
-      WHERE expiry_date >= date('now') AND expiry_date <= date('now','+30 days')
-      GROUP BY product ORDER BY cnt DESC
-    `).all();
-
+    const byProduct = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+30 days') GROUP BY product ORDER BY cnt DESC`).all();
     if (byProduct.length) {
       let text = `📅 *Expiring This Month by Product*\n━━━━━━━━━━━━━━━━━━\n`;
-      byProduct.forEach(r => { text += `📦 ${r.product} → ${r.cnt} expiring\n`; });
+      byProduct.forEach(r => { text += `📦 ${r.product} → ${r.cnt}\n`; });
       await sendTelegram(text);
     }
-  } catch (e) { console.error('Summary:', e.message); }
+  } catch(e) { console.error('Summary:', e.message); }
 });
 
-// 1st of month — growth report
+// Monthly growth
 cron.schedule('0 10 1 * *', async () => {
   try {
     const thisMonth = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','start of month')`).get();
     const lastMonth = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','start of month','-1 month') AND start_date < date('now','start of month')`).get();
     const growth    = lastMonth.cnt > 0 ? Math.round(((thisMonth.cnt - lastMonth.cnt) / lastMonth.cnt) * 100) : 0;
-    const arrow     = growth >= 0 ? '📈' : '📉';
-
     await sendTelegram(
-      `${arrow} *Monthly Growth Report*\n━━━━━━━━━━━━━━━━━━\n` +
-      `Last Month: ${lastMonth.cnt} customers\n` +
-      `This Month: ${thisMonth.cnt} customers\n` +
-      `Growth: ${growth >= 0 ? '+' : ''}${growth}%`
+      `${growth >= 0 ? '📈' : '📉'} *Monthly Growth*\n━━━━━━━━━━━━━━━━━━\n` +
+      `Last Month: ${lastMonth.cnt}\nThis Month: ${thisMonth.cnt}\nGrowth: ${growth >= 0 ? '+' : ''}${growth}%`
     );
-  } catch (e) { console.error('Growth:', e.message); }
+  } catch(e) { console.error('Growth:', e.message); }
 });
 
 
@@ -814,6 +706,6 @@ cron.schedule('0 10 1 * *', async () => {
 // =============================================================
 
 app.listen(config.PORT, () => {
-  console.log(`FanFlix Bot v2.0 running on port ${config.PORT}`);
-  sendTelegram('🚀 *FanFlix Bot v2.0 Started!*\nAll systems ready.').catch(() => {});
+  console.log(`FanFlix Bot v2.1 running on port ${config.PORT}`);
+  sendTelegram('🚀 *FanFlix Bot v2.1 Started!*\nNo Shopify API needed. All systems ready.').catch(() => {});
 });
