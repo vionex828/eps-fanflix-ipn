@@ -200,7 +200,7 @@ function today() {
 
 function isLateNight() {
   const hour = new Date().getHours();
-  return hour >= 23 || hour < 7;
+  return hour >= 23;
 }
 
 function formatSMS(template, vars = {}) {
@@ -421,7 +421,8 @@ app.post('/eps-ipn', async (req, res) => {
       `🕐 Time: ${time}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🛒 Order: ${pendingOrder.order_name}\n` +
-      `${productTypeEmoji(productType)} | ${product}${variant ? ` — ${variant}` : ''}\n`;
+      `${productTypeEmoji(productType)} | ${product}\n` +
+      (variant ? `📦 Variant: ${variant}\n` : '');
 
     if (oneTime) {
       alert += `🎁 One-time delivery — no expiry\n`;
@@ -833,6 +834,22 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
+// 10 AM — good morning summary
+cron.schedule('0 10 * * *', async () => {
+  try {
+    const todayExp  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date = date('now')`).get();
+    const yestRev   = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS rev FROM customers WHERE start_date = date('now','-1 day')`).get();
+    const pending   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE is_delivered = 0 AND start_date = date('now','-1 day')`).get();
+    await sendTelegram(
+      `🌅 *Good Morning!*\n━━━━━━━━━━━━━━━━━━\n` +
+      `📅 Expiring Today: ${todayExp.cnt}\n` +
+      `💰 Yesterday Revenue: ৳${yestRev.rev.toFixed(2)}\n` +
+      `📦 Pending Deliveries: ${pending.cnt}\n` +
+      `Let's have a great day! 💪`
+    );
+  } catch(e) { console.error('Good morning:', e.message); }
+});
+
 // 10 PM — tomorrow's expiry preview
 cron.schedule('0 22 * * *', async () => {
   try {
@@ -851,11 +868,33 @@ cron.schedule('0 23 * * *', async () => {
     const t        = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS revenue, COUNT(*) AS orders FROM customers WHERE start_date = date('now')`).get();
     const expiring = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days')`).get();
     const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
+    // Payment method breakdown
+    const methods = db.prepare(`
+      SELECT p.status, COUNT(*) as cnt,
+        SUM(CASE WHEN p.phone IN (SELECT phone FROM customers WHERE start_date = date('now')) THEN 1 ELSE 0 END) as matched
+      FROM payments p WHERE p.created_at >= datetime('now', 'start of day')
+      GROUP BY p.status
+    `).all();
+
+    const bkash  = db.prepare(`SELECT COUNT(*) as cnt FROM payments WHERE created_at >= datetime('now','start of day') AND status = 'Success'`).get();
+
     await sendTelegram(
       `📊 *Daily Summary*\n━━━━━━━━━━━━━━━━━━\n` +
       `✅ New Orders: ${t.orders}\n💰 Revenue: ৳${t.revenue.toFixed(2)}\n` +
       `👥 Active: ${active.cnt}\n⚠️ Expiring This Week: ${expiring.cnt}`
     );
+
+    // Best day ever check
+    const allDays = db.prepare(`SELECT start_date, SUM(store_amount) AS rev FROM customers GROUP BY start_date ORDER BY rev DESC LIMIT 1`).get();
+    const todayRev = t.revenue;
+    if (allDays && todayRev > allDays.rev && allDays.start_date !== today()) {
+      await sendTelegram(
+        `🏆 *Best Day Ever!*\n━━━━━━━━━━━━━━━━━━\n` +
+        `💰 Revenue: ৳${todayRev.toFixed(2)}\n` +
+        `📈 Previous Record: ৳${allDays.rev.toFixed(2)}\n` +
+        `Congratulations! 🎉`
+      );
+    }
 
     const byProduct = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+30 days') GROUP BY product ORDER BY cnt DESC`).all();
     if (byProduct.length) {
