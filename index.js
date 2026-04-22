@@ -341,23 +341,22 @@ app.get('/', (req, res) => res.send('FanFlix Bot v4.0'));
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   bot.sendMessage(msg.chat.id,
-    `👋 *FanFlix Bot v4\.0*\n\n` +
-    `📋 *Commands:*\n` +
-    `/customers — Active customers\n` +
-    `/expiring — Expiring this week\n` +
-    `/today — Today\'s orders\n` +
-    `/revenue — Revenue report\n` +
-    `/stats — Business overview\n` +
-    `/product — Sales by product\n` +
-    `/retention — Retention rate\n` +
-    `/top — Top customers\n` +
-    `/pending — Unmatched payments\n` +
-    `/search 01874\.\.\. — Find customer\n` +
-    `/add — Add customer\n` +
-    `/edit — Edit expiry date\n` +
-    `/delete — Remove customer\n` +
-    `/export — Export CSV`,
-    { parse_mode: 'MarkdownV2' });
+    `👋 FanFlix Bot v4.0\n\n` +
+    `📋 Commands:\n` +
+    `/customers - Active customers\n` +
+    `/expiring - Expiring this week\n` +
+    `/today - Today's orders\n` +
+    `/revenue - Revenue report\n` +
+    `/stats - Business overview\n` +
+    `/product - Sales by product\n` +
+    `/retention - Retention rate\n` +
+    `/top - Top customers\n` +
+    `/pending - Unmatched payments\n` +
+    `/search 01874 - Find customer\n` +
+    `/add - Add customer\n` +
+    `/edit - Edit expiry date\n` +
+    `/delete - Remove customer\n` +
+    `/export - Export CSV`);
 });
 
 bot.onText(/\/customers/, (msg) => {
