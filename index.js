@@ -1,6 +1,5 @@
 // =============================================
-//   FANFLIX BOT v2.1
-//   No Shopify API needed - uses webhooks only
+//   FANFLIX BOT v3.0 - COMPLETE FINAL
 // =============================================
 
 const express     = require('express');
@@ -10,7 +9,6 @@ const cron        = require('node-cron');
 const axios       = require('axios');
 const crypto      = require('crypto');
 const config      = require('./config');
-
 
 // =============================================================
 //  DATABASE
@@ -25,15 +23,18 @@ db.exec(`
     phone             TEXT,
     email             TEXT,
     product           TEXT,
+    product_type      TEXT,
     variant           TEXT,
     order_id          TEXT,
     order_name        TEXT,
     amount            REAL,
+    store_amount      REAL,
     duration_days     INTEGER,
     start_date        TEXT,
     expiry_date       TEXT,
     renewal_count     INTEGER DEFAULT 1,
     is_vip            INTEGER DEFAULT 0,
+    is_delivered      INTEGER DEFAULT 0,
     reminder_3_sent   INTEGER DEFAULT 0,
     reminder_1_sent   INTEGER DEFAULT 0,
     winback_sent      INTEGER DEFAULT 0,
@@ -71,7 +72,6 @@ db.exec(`
   );
 `);
 
-// Default SMS messages
 const defaults = {
   msg3:     'FanFlix: আপনার {product} subscription ৩ দিন পর শেষ হবে। Renew করুন: fanflixbd.com',
   msg1:     'FanFlix: আপনার {product} subscription আগামীকাল শেষ হবে! Renew করুন: fanflixbd.com',
@@ -97,8 +97,8 @@ function setSetting(key, value) {
 
 const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 
-function sendTelegram(message) {
-  return bot.sendMessage(config.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+function sendTelegram(message, options = {}) {
+  return bot.sendMessage(config.TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown', ...options });
 }
 function isOwner(msg) {
   return String(msg.chat.id) === String(config.TELEGRAM_CHAT_ID);
@@ -127,6 +127,33 @@ function normalizePhone(raw = '') {
   return p;
 }
 
+// Detect product type
+function detectProductType(name = '') {
+  const n = name.toLowerCase();
+  if (n.includes('gift card') || n.includes('itunes') || n.includes('psn') ||
+      n.includes('steam') || n.includes('valorant') || n.includes('razer') ||
+      n.includes('roblox') || n.includes('pubg') || n.includes('voucher') ||
+      n.includes('top up') || n.includes('uc')) return 'giftcard';
+  if (n.includes('windows') || n.includes('idm') || n.includes('adobe') ||
+      n.includes('office') || n.includes('icloud') || n.includes('google one') ||
+      n.includes('lifetime') || n.includes('key')) return 'software';
+  if (n.includes('chatgpt') || n.includes('claude') || n.includes('gemini') ||
+      n.includes('grok') || n.includes('perplexity') || n.includes('ideogram') ||
+      n.includes('quillbot') || n.includes('duolingo')) return 'ai';
+  return 'subscription';
+}
+
+function productTypeEmoji(type) {
+  if (type === 'giftcard')    return '🎁 Gift Card';
+  if (type === 'software')    return '🔑 Software';
+  if (type === 'ai')          return '🤖 AI Tool';
+  return '📺 Subscription';
+}
+
+function isOneTime(type) {
+  return type === 'giftcard' || type === 'software';
+}
+
 function parseDuration(text = '') {
   const t = text.toLowerCase();
   if (t.includes('1 year') || t.includes('12 month')) return 365;
@@ -150,6 +177,17 @@ function formatDate(dateStr) {
   });
 }
 
+function formatEPSTime(timeStr) {
+  try {
+    const d = new Date(timeStr);
+    const date = d.toLocaleDateString('en-US', { day: '2-digit', month: 'long', year: 'numeric' });
+    const time = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+    return `${date}, ${time}`;
+  } catch {
+    return timeStr;
+  }
+}
+
 function daysUntil(dateStr) {
   const t = new Date(); t.setHours(0, 0, 0, 0);
   const e = new Date(dateStr); e.setHours(0, 0, 0, 0);
@@ -158,6 +196,11 @@ function daysUntil(dateStr) {
 
 function today() {
   return new Date().toISOString().split('T')[0];
+}
+
+function isLateNight() {
+  const hour = new Date().getHours();
+  return hour >= 23 || hour < 7;
 }
 
 function formatSMS(template, vars = {}) {
@@ -169,11 +212,11 @@ function formatSMS(template, vars = {}) {
 
 
 // =============================================================
-//  SMS
+//  SMS - Fixed 880 format
 // =============================================================
 
 async function sendSMS(phone, message) {
-  const number = '88' + normalizePhone(phone);
+  const number = '880' + normalizePhone(phone);
   await axios.post('https://bulksmsbd.net/api/smsapi', null, {
     params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
   });
@@ -189,7 +232,7 @@ app.use(express.json());
 
 
 // =============================================================
-//  SHOPIFY WEBHOOK - receives order data (no API token needed!)
+//  SHOPIFY WEBHOOK
 // =============================================================
 
 app.post('/shopify-order', async (req, res) => {
@@ -206,18 +249,16 @@ app.post('/shopify-order', async (req, res) => {
 
     if (!phone) return;
 
-    // Save to pending orders
     db.prepare(`
       INSERT OR IGNORE INTO pending_orders
         (shopify_order_id, order_name, name, phone, email, product, variant, amount)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(String(order.id), order.name, name, phone, email, product, variant, amount);
 
-    // Schedule follow-up SMS after 1 hour if not paid
+    // Follow-up after 1 hour if unpaid
     setTimeout(async () => {
       const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(order.id));
       if (!pending || pending.paid === 1 || pending.followup_sent === 1) return;
-
       try {
         const smsText = formatSMS(getSetting('followup'), { link: config.EPS_PAYMENT_LINK });
         await sendSMS(phone, smsText);
@@ -237,7 +278,7 @@ app.post('/shopify-order', async (req, res) => {
 
 
 // =============================================================
-//  EPS IPN - receives payment
+//  EPS IPN
 // =============================================================
 
 app.post('/eps-ipn', async (req, res) => {
@@ -257,23 +298,26 @@ app.post('/eps-ipn', async (req, res) => {
         `👤 Name: ${p.customerName || 'N/A'}\n` +
         `📱 Phone: ${p.customerPhone || 'N/A'}\n` +
         `📧 Email: ${p.customerEmail || 'N/A'}\n` +
-        `📍 Address: ${p.customerAddress || 'N/A'}\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `💰 Amount: ৳${p.totalAmount}\n` +
         `💳 Method: ${p.financialEntity || 'N/A'}\n` +
         `📋 Status: ${p.status}\n` +
         `🆔 EPS TXN: ${p.epsTransactionId}\n` +
-        `🕐 Time: ${p.transactionDate}\n` +
+        `🕐 Time: ${formatEPSTime(p.transactionDate)}\n` +
         `━━━━━━━━━━━━━━━━━━`
       );
       return;
     }
 
-    const phone    = p.customerPhone    || '';
-    const name     = p.customerName     || 'Customer';
-    const email    = p.customerEmail    || '';
-    const amount   = parseFloat(p.storeAmount || p.totalAmount || 0);
-    const epsTxnId = p.epsTransactionId || '';
+    const phone      = p.customerPhone    || '';
+    const name       = p.customerName     || 'Customer';
+    const email      = p.customerEmail    || '';
+    const totalAmt   = parseFloat(p.totalAmount  || 0);
+    const storeAmt   = parseFloat(p.storeAmount  || 0);
+    const gatewayFee = (totalAmt - storeAmt).toFixed(2);
+    const epsTxnId   = p.epsTransactionId || '';
+    const method     = p.financialEntity  || 'N/A';
+    const time       = formatEPSTime(p.transactionDate);
 
     // Skip already processed
     const seen = db.prepare('SELECT id FROM payments WHERE eps_txn_id = ?').get(epsTxnId);
@@ -288,15 +332,16 @@ app.post('/eps-ipn', async (req, res) => {
     if (recentDup) {
       await sendTelegram(
         `⚠️ *Duplicate Payment Alert!*\n` +
-        `👤 Name: ${name}\n📱 Phone: ${phone}\n💰 Amount: ৳${amount}\n🆔 TXN: ${epsTxnId}`
+        `👤 Name: ${name}\n📱 Phone: ${phone}\n` +
+        `💰 Amount: ৳${totalAmt}\n🆔 TXN: ${epsTxnId}`
       );
     }
 
     // Save payment
     db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, status) VALUES (?, ?, ?, ?)')
-      .run(epsTxnId, normalizePhone(phone), amount, p.status);
+      .run(epsTxnId, normalizePhone(phone), totalAmt, p.status);
 
-    // Find matching pending order from Shopify webhook
+    // Find matching pending order
     const pendingOrder = db.prepare(`
       SELECT * FROM pending_orders WHERE phone = ? AND paid = 0
       ORDER BY created_at DESC LIMIT 1
@@ -309,71 +354,112 @@ app.post('/eps-ipn', async (req, res) => {
         `👤 Name: ${name}\n` +
         `📱 Phone: ${phone}\n` +
         `📧 Email: ${email || 'N/A'}\n` +
-        `📍 Address: ${p.customerAddress || 'N/A'}\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `💰 Amount: ৳${p.totalAmount}\n` +
-        `🏪 Store Amount: ৳${p.storeAmount}\n` +
-        `💳 Method: ${p.financialEntity || 'N/A'}\n` +
+        `💰 Customer Paid: ৳${totalAmt}\n` +
+        `🏪 You Receive: ৳${storeAmt}\n` +
+        `📊 Gateway Fee: ৳${gatewayFee}\n` +
+        `💳 Method: ${method}\n` +
         `🆔 EPS TXN: ${epsTxnId}\n` +
-        `🕐 Time: ${p.transactionDate}\n` +
+        `🕐 Time: ${time}\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `⚠️ No Shopify Order Found!`
       );
       return;
     }
 
-    // Mark order as paid
+    // Mark order paid
     db.prepare('UPDATE pending_orders SET paid = 1 WHERE id = ?').run(pendingOrder.id);
 
     const product      = pendingOrder.product;
     const variant      = pendingOrder.variant;
-    const durationDays = parseDuration(variant || product);
+    const productType  = detectProductType(product);
+    const oneTime      = isOneTime(productType);
+    const durationDays = oneTime ? null : parseDuration(variant || product);
     const startDate    = today();
-    const expiryDate   = addDays(durationDays);
+    const expiryDate   = oneTime ? null : addDays(durationDays);
 
-    // Check renewal count
+    // Check renewal & VIP
     const existing = db.prepare('SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1')
       .get(normalizePhone(phone));
+    const isFirstTime  = !existing;
     const renewalCount = existing ? existing.renewal_count + 1 : 1;
     const isVip        = renewalCount >= config.VIP_RENEWAL_COUNT ? 1 : 0;
 
+    // Duplicate order detection (same product same customer recently)
+    const dupOrder = db.prepare(`
+      SELECT * FROM customers WHERE phone = ? AND product = ?
+      AND created_at > datetime('now', '-24 hours')
+      LIMIT 1
+    `).get(normalizePhone(phone), product);
+
     // Save customer
-    db.prepare(`
+    const customerId = db.prepare(`
       INSERT INTO customers
-        (name, phone, email, product, variant, order_id, order_name, amount, duration_days, start_date, expiry_date, renewal_count, is_vip)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (name, phone, email, product, product_type, variant, order_id, order_name, amount, store_amount, duration_days, start_date, expiry_date, renewal_count, is_vip)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name, normalizePhone(phone), email,
-      product, variant,
+      product, productType, variant,
       pendingOrder.shopify_order_id, pendingOrder.order_name,
-      amount, durationDays, startDate, expiryDate,
+      totalAmt, storeAmt, durationDays, startDate, expiryDate,
       renewalCount, isVip
-    );
+    ).lastInsertRowid;
 
-    // Build combined Telegram alert
+    // Build alert
     let alert =
       `✅ *New Payment — FanFlix*\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `👤 Name: ${name}\n` +
       `📱 Phone: ${phone}\n` +
       `📧 Email: ${email || 'N/A'}\n` +
-      `📍 Address: ${p.customerAddress || 'N/A'}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💰 Amount: ৳${p.totalAmount}\n` +
-      `🏪 Store Amount: ৳${p.storeAmount}\n` +
-      `💳 Method: ${p.financialEntity || 'N/A'}\n` +
+      `💰 Customer Paid: ৳${totalAmt}\n` +
+      `🏪 You Receive: ৳${storeAmt}\n` +
+      `📊 Gateway Fee: ৳${gatewayFee}\n` +
+      `💳 Method: ${method}\n` +
       `🆔 EPS TXN: ${epsTxnId}\n` +
-      `🕐 Time: ${p.transactionDate}\n` +
+      `🕐 Time: ${time}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🛒 Order: ${pendingOrder.order_name}\n` +
-      `📦 Product: ${product}${variant ? ` — ${variant}` : ''}\n` +
-      `📅 Expires: ${formatDate(expiryDate)}\n`;
+      `${productTypeEmoji(productType)} | ${product}${variant ? ` — ${variant}` : ''}\n`;
 
-    if (renewalCount > 1) alert += `🔄 Renewal #${renewalCount}\n`;
-    if (isVip)            alert += `⭐ VIP Customer\n`;
+    if (oneTime) {
+      alert += `🎁 One-time delivery — no expiry\n`;
+    } else {
+      alert += `📅 Expires: ${formatDate(expiryDate)}\n`;
+    }
+
+    if (isFirstTime)        alert += `🎉 First Time Customer!\n`;
+    if (renewalCount > 1)   alert += `🔄 Renewal #${renewalCount}\n`;
+    if (isVip)              alert += `⭐ VIP Customer\n`;
+    if (dupOrder)           alert += `⚠️ Possible Duplicate Order! Same product ordered recently\n`;
+    if (isLateNight())      alert += `🌙 Late Night Order — deliver tomorrow morning\n`;
+
     alert += `━━━━━━━━━━━━━━━━━━`;
 
-    await sendTelegram(alert);
+    // Send with Delivered/Issue buttons
+    await bot.sendMessage(config.TELEGRAM_CHAT_ID, alert, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Delivered', callback_data: `delivered_${customerId}` },
+          { text: '❌ Issue', callback_data: `issue_${customerId}` }
+        ]]
+      }
+    });
+
+    // 30 min undelivered reminder
+    setTimeout(async () => {
+      const c = db.prepare('SELECT * FROM customers WHERE id = ?').get(customerId);
+      if (!c || c.is_delivered === 1) return;
+      await sendTelegram(
+        `⏰ *Delivery Reminder!*\n` +
+        `👤 ${name} | 📱 ${phone}\n` +
+        `📦 ${product}\n` +
+        `💰 ৳${totalAmt}\n` +
+        `⚠️ 30 mins passed — delivered?`
+      );
+    }, 30 * 60 * 1000);
 
   } catch (err) {
     console.error('IPN Error:', err.message);
@@ -381,7 +467,53 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('✅ FanFlix Bot v2.1 Running'));
+app.get('/', (req, res) => res.send('✅ FanFlix Bot v3.0 Running'));
+
+
+// =============================================================
+//  CALLBACK HANDLERS (Delivered / Issue buttons)
+// =============================================================
+
+bot.on('callback_query', async (query) => {
+  const data = query.data;
+  const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
+
+  if (data.startsWith('delivered_')) {
+    const id = parseInt(data.split('_')[1]);
+    db.prepare('UPDATE customers SET is_delivered = 1 WHERE id = ?').run(id);
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId });
+    await bot.answerCallbackQuery(query.id, { text: '✅ Marked as delivered!' });
+    await bot.sendMessage(chatId, `✅ *Order delivered!*`, { parse_mode: 'Markdown' });
+  }
+
+  if (data.startsWith('issue_')) {
+    const id = parseInt(data.split('_')[1]);
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId });
+    await bot.answerCallbackQuery(query.id, { text: 'Select issue type' });
+    await bot.sendMessage(chatId, `❌ *What is the issue?*`, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💳 Wrong Payment', callback_data: `issuetype_${id}_wrong_payment` }],
+          [{ text: '📦 Wrong Product', callback_data: `issuetype_${id}_wrong_product` }],
+          [{ text: '👤 Wrong Customer', callback_data: `issuetype_${id}_wrong_customer` }],
+          [{ text: '🔄 Duplicate Order', callback_data: `issuetype_${id}_duplicate` }],
+          [{ text: '⚠️ Other', callback_data: `issuetype_${id}_other` }],
+        ]
+      }
+    });
+  }
+
+  if (data.startsWith('issuetype_')) {
+    const parts   = data.split('_');
+    const id      = parts[1];
+    const issueType = parts.slice(2).join(' ');
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId });
+    await bot.answerCallbackQuery(query.id, { text: 'Issue recorded!' });
+    await bot.sendMessage(chatId, `⚠️ *Issue recorded:* ${issueType}\nOrder ID: ${id}`, { parse_mode: 'Markdown' });
+  }
+});
 
 
 // =============================================================
@@ -391,7 +523,7 @@ app.get('/', (req, res) => res.send('✅ FanFlix Bot v2.1 Running'));
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   bot.sendMessage(msg.chat.id,
-    `👋 *FanFlix Bot v2.1*\n\n` +
+    `👋 *FanFlix Bot v3.0*\n\n` +
     `📋 *Commands:*\n` +
     `/customers — Active customers\n` +
     `/expiring — Expiring this week\n` +
@@ -442,23 +574,23 @@ bot.onText(/\/today/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers WHERE start_date = date('now') ORDER BY created_at DESC`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No orders today.');
-  const total = rows.reduce((s, c) => s + c.amount, 0);
+  const total = rows.reduce((s, c) => s + c.store_amount, 0);
   let text = `📅 *Today's Orders (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} — ${c.product} — ৳${c.amount}\n`; });
-  text += `━━━━━━━━━━━━━━━━━━\n💰 Total: ৳${total}`;
+  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} — ${c.product} — ৳${c.store_amount}\n`; });
+  text += `━━━━━━━━━━━━━━━━━━\n💰 Total: ৳${total.toFixed(2)}`;
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/revenue/, (msg) => {
   if (!isOwner(msg)) return;
-  const t = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = date('now')`).get();
-  const w = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-7 days')`).get();
-  const m = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-30 days')`).get();
+  const t = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = date('now')`).get();
+  const w = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-7 days')`).get();
+  const m = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-30 days')`).get();
   bot.sendMessage(msg.chat.id,
     `💰 *Revenue Report*\n━━━━━━━━━━━━━━━━━━\n` +
-    `📅 Today:      ৳${t.total} (${t.cnt} orders)\n` +
-    `📅 This Week:  ৳${w.total} (${w.cnt} orders)\n` +
-    `📅 This Month: ৳${m.total} (${m.cnt} orders)`,
+    `📅 Today:      ৳${t.total.toFixed(2)} (${t.cnt} orders)\n` +
+    `📅 This Week:  ৳${w.total.toFixed(2)} (${w.cnt} orders)\n` +
+    `📅 This Month: ৳${m.total.toFixed(2)} (${m.cnt} orders)`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -467,16 +599,18 @@ bot.onText(/\/stats/, (msg) => {
   if (!isOwner(msg)) return;
   const active  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
   const expired = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date < date('now')`).get();
-  const total   = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM customers`).get();
+  const onetime = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date IS NULL`).get();
+  const total   = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total FROM customers`).get();
   const vip     = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE is_vip = 1 AND expiry_date >= date('now')`).get();
   const best    = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers GROUP BY product ORDER BY cnt DESC LIMIT 1`).get();
   bot.sendMessage(msg.chat.id,
     `📊 *Business Overview*\n━━━━━━━━━━━━━━━━━━\n` +
-    `👥 Total: ${active.cnt + expired.cnt}\n` +
-    `✅ Active: ${active.cnt}\n` +
+    `👥 Total: ${active.cnt + expired.cnt + onetime.cnt}\n` +
+    `✅ Active Subscriptions: ${active.cnt}\n` +
+    `🎁 One-time Deliveries: ${onetime.cnt}\n` +
     `❌ Expired: ${expired.cnt}\n` +
     `⭐ VIP: ${vip.cnt}\n` +
-    `💰 Total Revenue: ৳${total.total}\n` +
+    `💰 Total Revenue: ৳${total.total.toFixed(2)}\n` +
     `🔥 Best Product: ${best?.product || 'N/A'}`,
     { parse_mode: 'Markdown' }
   );
@@ -484,10 +618,10 @@ bot.onText(/\/stats/, (msg) => {
 
 bot.onText(/\/product/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT product, COUNT(*) AS cnt, SUM(amount) AS revenue FROM customers GROUP BY product ORDER BY cnt DESC`).all();
+  const rows = db.prepare(`SELECT product, COUNT(*) AS cnt, SUM(store_amount) AS revenue FROM customers GROUP BY product ORDER BY cnt DESC`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
   let text = `📦 *Sales by Product*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach(r => { text += `📦 ${r.product}\n👥 ${r.cnt} | 💰 ৳${r.revenue}\n\n`; });
+  rows.forEach(r => { text += `📦 ${r.product}\n👥 ${r.cnt} | 💰 ৳${r.revenue.toFixed(2)}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
@@ -505,10 +639,10 @@ bot.onText(/\/retention/, (msg) => {
 
 bot.onText(/\/top/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS renewals, SUM(amount) AS spent FROM customers GROUP BY phone ORDER BY renewals DESC LIMIT 10`).all();
+  const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS renewals, SUM(store_amount) AS spent FROM customers GROUP BY phone ORDER BY renewals DESC LIMIT 10`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
   let text = `🏆 *Top Customers*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} | 📱 0${c.phone}\n🔄 ${c.renewals} renewals | 💰 ৳${c.spent}\n\n`; });
+  rows.forEach((c, i) => { text += `${i + 1}. ${c.name} | 📱 0${c.phone}\n🔄 ${c.renewals} renewals | 💰 ৳${c.spent.toFixed(2)}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
@@ -532,8 +666,9 @@ bot.onText(/\/search (.+)/, (msg, match) => {
   if (!rows.length) return bot.sendMessage(msg.chat.id, '🔍 No customer found.');
   let text = `🔍 *"${query}"*\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach(c => {
-    const d = daysUntil(c.expiry_date);
-    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} | ${d > 0 ? `✅ Active (${d}d)` : '❌ Expired'}\n🔄 Renewal #${c.renewal_count} | 💰 ৳${c.amount}\n\n`;
+    const d = c.expiry_date ? daysUntil(c.expiry_date) : null;
+    const status = c.expiry_date ? (d > 0 ? `✅ Active (${d}d)` : '❌ Expired') : '🎁 One-time';
+    text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n${status} | 🔄 #${c.renewal_count} | 💰 ৳${c.store_amount}\n\n`;
   });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
@@ -542,14 +677,14 @@ bot.onText(/\/export/, async (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers ORDER BY created_at DESC`).all();
   if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No data.');
-  let csv = 'Name,Phone,Email,Product,Amount,Start,Expiry,Renewals,VIP\n';
+  let csv = 'Name,Phone,Email,Product,Type,Amount,Start,Expiry,Renewals,VIP\n';
   rows.forEach(c => {
-    csv += `"${c.name}","0${c.phone}","${c.email}","${c.product}",${c.amount},${c.start_date},${c.expiry_date},${c.renewal_count},${c.is_vip ? 'Yes' : 'No'}\n`;
+    csv += `"${c.name}","0${c.phone}","${c.email}","${c.product}","${c.product_type}",${c.store_amount},${c.start_date},${c.expiry_date || 'N/A'},${c.renewal_count},${c.is_vip ? 'Yes' : 'No'}\n`;
   });
   bot.sendDocument(msg.chat.id, Buffer.from(csv, 'utf8'), {}, { filename: `fanflix_${today()}.csv`, contentType: 'text/csv' });
 });
 
-// /add multi-step
+// /add
 const addState = {};
 bot.onText(/\/add/, (msg) => {
   if (!isOwner(msg)) return;
@@ -557,7 +692,7 @@ bot.onText(/\/add/, (msg) => {
   bot.sendMessage(msg.chat.id, '👤 Enter customer *name*:', { parse_mode: 'Markdown' });
 });
 
-// /edit multi-step
+// /edit
 const editState = {};
 bot.onText(/\/edit/, (msg) => {
   if (!isOwner(msg)) return;
@@ -565,7 +700,7 @@ bot.onText(/\/edit/, (msg) => {
   bot.sendMessage(msg.chat.id, '📱 Enter phone number to edit:', { parse_mode: 'Markdown' });
 });
 
-// /delete multi-step
+// /delete
 const deleteState = {};
 bot.onText(/\/delete/, (msg) => {
   if (!isOwner(msg)) return;
@@ -606,15 +741,15 @@ bot.on('message', (msg) => {
   if (addState[cid]) {
     const s = addState[cid];
     if (s.step === 'name')     { s.name = text; s.step = 'phone'; return bot.sendMessage(cid, '📱 Enter phone:'); }
-    if (s.step === 'phone')    { s.phone = normalizePhone(text); s.step = 'product'; return bot.sendMessage(cid, '📦 Enter product (e.g. Netflix 1 Month):'); }
-    if (s.step === 'product')  { s.product = text; s.step = 'duration'; return bot.sendMessage(cid, '⏳ Enter duration in days (e.g. 30):'); }
+    if (s.step === 'phone')    { s.phone = normalizePhone(text); s.step = 'product'; return bot.sendMessage(cid, '📦 Enter product:'); }
+    if (s.step === 'product')  { s.product = text; s.step = 'duration'; return bot.sendMessage(cid, '⏳ Duration in days (0 for one-time):'); }
     if (s.step === 'duration') {
-      const days = parseInt(text) || 30;
-      const exp  = addDays(days);
-      db.prepare(`INSERT INTO customers (name, phone, product, amount, duration_days, start_date, expiry_date, renewal_count) VALUES (?, ?, ?, 0, ?, ?, ?, 1)`)
-        .run(s.name, s.phone, s.product, days, today(), exp);
+      const days = parseInt(text) || 0;
+      const exp  = days > 0 ? addDays(days) : null;
+      db.prepare(`INSERT INTO customers (name, phone, product, product_type, amount, store_amount, duration_days, start_date, expiry_date, renewal_count) VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, 1)`)
+        .run(s.name, s.phone, s.product, detectProductType(s.product), days || null, today(), exp);
       delete addState[cid];
-      return bot.sendMessage(cid, `✅ Added!\n👤 ${s.name}\n📦 ${s.product}\n📅 Expires: ${formatDate(exp)}`);
+      return bot.sendMessage(cid, `✅ Added!\n👤 ${s.name}\n📦 ${s.product}\n📅 ${exp ? formatDate(exp) : 'One-time'}`);
     }
   }
 
@@ -625,12 +760,12 @@ bot.on('message', (msg) => {
       const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
       if (!c) { delete editState[cid]; return bot.sendMessage(cid, '❌ Not found.'); }
       s.customer = c; s.step = 'date';
-      return bot.sendMessage(cid, `Found: *${c.name}*\nCurrent expiry: ${formatDate(c.expiry_date)}\n\nEnter new date (YYYY-MM-DD):`, { parse_mode: 'Markdown' });
+      return bot.sendMessage(cid, `Found: *${c.name}*\nExpiry: ${c.expiry_date ? formatDate(c.expiry_date) : 'One-time'}\n\nNew date (YYYY-MM-DD):`, { parse_mode: 'Markdown' });
     }
     if (s.step === 'date') {
       db.prepare(`UPDATE customers SET expiry_date = ?, reminder_3_sent = 0, reminder_1_sent = 0 WHERE id = ?`).run(text, s.customer.id);
       delete editState[cid];
-      return bot.sendMessage(cid, `✅ Expiry updated to *${formatDate(text)}*`, { parse_mode: 'Markdown' });
+      return bot.sendMessage(cid, `✅ Updated to *${formatDate(text)}*`, { parse_mode: 'Markdown' });
     }
   }
 
@@ -641,7 +776,7 @@ bot.on('message', (msg) => {
       const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
       if (!c) { delete deleteState[cid]; return bot.sendMessage(cid, '❌ Not found.'); }
       s.customer = c; s.step = 'confirm';
-      return bot.sendMessage(cid, `Found: *${c.name}* | ${c.product}\n\nType *YES* to confirm:`, { parse_mode: 'Markdown' });
+      return bot.sendMessage(cid, `Found: *${c.name}* | ${c.product}\nType *YES* to confirm:`, { parse_mode: 'Markdown' });
     }
     if (s.step === 'confirm') {
       if (text === 'YES') {
@@ -660,9 +795,8 @@ bot.on('message', (msg) => {
 //  SCHEDULED TASKS
 // =============================================================
 
+// 9 AM — reminders
 cron.schedule('0 9 * * *', async () => {
-
-  // 3-day reminder
   const in3 = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','+3 days') AND reminder_3_sent = 0`).all();
   for (const c of in3) {
     try {
@@ -672,7 +806,6 @@ cron.schedule('0 9 * * *', async () => {
     } catch(e) { console.error('SMS 3d:', e.message); }
   }
 
-  // 1-day reminder
   const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','+1 day') AND reminder_1_sent = 0`).all();
   for (const c of in1) {
     try {
@@ -682,17 +815,15 @@ cron.schedule('0 9 * * *', async () => {
     } catch(e) { console.error('SMS 1d:', e.message); }
   }
 
-  // Win-back
   const winback = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','-${config.WINBACK_DAYS_AFTER_EXPIRY} days') AND winback_sent = 0`).all();
   for (const c of winback) {
     try {
       await sendSMS(c.phone, formatSMS(getSetting('winback'), { product: c.product }));
       db.prepare('UPDATE customers SET winback_sent = 1 WHERE id = ?').run(c.id);
-      await sendTelegram(`🏆 *Win-back SMS Sent*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}`);
+      await sendTelegram(`🏆 *Win-back SMS*\n👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product}`);
     } catch(e) { console.error('Winback:', e.message); }
   }
 
-  // Lost customer alert
   const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','-${config.LOST_ALERT_DAYS_AFTER_EXPIRY} days') AND lost_alert_sent = 0`).all();
   for (const c of lost) {
     try {
@@ -702,17 +833,30 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
-// 11 PM summary
+// 10 PM — tomorrow's expiry preview
+cron.schedule('0 22 * * *', async () => {
+  try {
+    const tomorrow = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','+1 day')`).all();
+    if (tomorrow.length) {
+      let text = `📅 *Expiring Tomorrow (${tomorrow.length})*\n━━━━━━━━━━━━━━━━━━\n`;
+      tomorrow.forEach(c => { text += `👤 ${c.name} — ${c.product}\n📱 0${c.phone}\n\n`; });
+      await sendTelegram(text);
+    }
+  } catch(e) { console.error('Tomorrow expiry:', e.message); }
+});
+
+// 11 PM — daily summary
 cron.schedule('0 23 * * *', async () => {
   try {
-    const t        = db.prepare(`SELECT COALESCE(SUM(amount),0) AS revenue, COUNT(*) AS orders FROM customers WHERE start_date = date('now')`).get();
+    const t        = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS revenue, COUNT(*) AS orders FROM customers WHERE start_date = date('now')`).get();
     const expiring = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days')`).get();
     const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
     await sendTelegram(
       `📊 *Daily Summary*\n━━━━━━━━━━━━━━━━━━\n` +
-      `✅ New Orders: ${t.orders}\n💰 Revenue: ৳${t.revenue}\n` +
+      `✅ New Orders: ${t.orders}\n💰 Revenue: ৳${t.revenue.toFixed(2)}\n` +
       `👥 Active: ${active.cnt}\n⚠️ Expiring This Week: ${expiring.cnt}`
     );
+
     const byProduct = db.prepare(`SELECT product, COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+30 days') GROUP BY product ORDER BY cnt DESC`).all();
     if (byProduct.length) {
       let text = `📅 *Expiring This Month by Product*\n━━━━━━━━━━━━━━━━━━\n`;
@@ -722,7 +866,7 @@ cron.schedule('0 23 * * *', async () => {
   } catch(e) { console.error('Summary:', e.message); }
 });
 
-// Monthly growth
+// 1st of month — growth report
 cron.schedule('0 10 1 * *', async () => {
   try {
     const thisMonth = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','start of month')`).get();
@@ -741,6 +885,6 @@ cron.schedule('0 10 1 * *', async () => {
 // =============================================================
 
 app.listen(config.PORT, () => {
-  console.log(`FanFlix Bot v2.1 running on port ${config.PORT}`);
-  sendTelegram('🚀 *FanFlix Bot v2.1 Started!*\nNo Shopify API needed. All systems ready.').catch(() => {});
+  console.log(`FanFlix Bot v3.0 running on port ${config.PORT}`);
+  sendTelegram('🚀 *FanFlix Bot v3.0 Started!*\nAll systems ready. 💪').catch(() => {});
 });
