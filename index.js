@@ -482,10 +482,26 @@ bot.on('callback_query', async (query) => {
 
   if (data.startsWith('delivered_')) {
     const id = parseInt(data.split('_')[1]);
+    const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
     db.prepare('UPDATE customers SET is_delivered = 1 WHERE id = ?').run(id);
+
+    // Calculate delivery time
+    const createdAt  = new Date(customer.created_at);
+    const now        = new Date();
+    const diffMins   = Math.round((now - createdAt) / 60000);
+
+    // React with heart on the message
+    try {
+      await bot.setMessageReaction(chatId, msgId, [{ type: 'emoji', emoji: '❤' }]);
+    } catch(e) { /* reaction may not be supported on all versions */ }
+
     await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msgId });
     await bot.answerCallbackQuery(query.id, { text: '✅ Marked as delivered!' });
-    await bot.sendMessage(chatId, `✅ *Order delivered!*`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId,
+      `✅ *Delivered to ${customer.name}!*\n` +
+      `⏱ Delivery time: ${diffMins} mins`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
   if (data.startsWith('issue_')) {
