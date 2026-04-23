@@ -364,33 +364,108 @@ bot.onText(/\/start/, (msg) => {
     `/export - Export CSV`);
 });
 
+const customerPages = {};
+
+function showCustomerPage(chatId, page = 0) {
+  const PAGE_SIZE = 5;
+  const allRows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') ORDER BY product, expiry_date ASC`).all();
+  if (!allRows.length) return bot.sendMessage(chatId, 'No active customers.');
+
+  const total = allRows.length;
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  const rows = allRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  // Group by product type for display
+  let text = `Active Customers (${total}) — Page ${page + 1}/${totalPages}\n`;
+  text += '━━━━━━━━━━━━━━━━━━\n';
+
+  let lastProduct = '';
+  rows.forEach((c, i) => {
+    const shortProduct = c.product.split(' - ')[0].split(' |')[0].substring(0, 20);
+    if (shortProduct !== lastProduct) {
+      text += `\n📦 ${shortProduct}\n`;
+      lastProduct = shortProduct;
+    }
+    text += `${c.is_vip ? '⭐' : ''}${c.name} | 0${c.phone} | ${formatDate(c.expiry_date)}\n`;
+  });
+
+  const buttons = [];
+  if (page > 0) buttons.push({ text: '◀️ Prev', callback_data: `cust_${page - 1}` });
+  if (page < totalPages - 1) buttons.push({ text: 'Next ▶️', callback_data: `cust_${page + 1}` });
+
+  const opts = buttons.length ? { reply_markup: { inline_keyboard: [buttons] } } : {};
+  return bot.sendMessage(chatId, text, opts);
+}
+
 bot.onText(/\/customers/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') ORDER BY expiry_date ASC LIMIT 20`).all();
-  if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No active customers.');
-  let text = `👥 *Active Customers (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach(c => { text += `${c.is_vip ? '⭐' : '👤'} ${c.name} | 📱 0${c.phone}\n📦 ${c.product}\n📅 ${formatDate(c.expiry_date)} (${daysUntil(c.expiry_date)}d)\n\n`; });
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  showCustomerPage(msg.chat.id, 0);
 });
+
+function showExpiringPage(chatId, page = 0) {
+  const PAGE_SIZE = 5;
+  const allRows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days') ORDER BY expiry_date ASC`).all();
+  if (!allRows.length) return bot.sendMessage(chatId, 'No one expiring this week!');
+
+  const totalPages = Math.ceil(allRows.length / PAGE_SIZE);
+  const rows = allRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  let text = `Expiring This Week (${allRows.length}) — Page ${page + 1}/${totalPages}\n`;
+  text += '━━━━━━━━━━━━━━━━━━\n';
+  rows.forEach(c => {
+    const shortProduct = c.product.split(' - ')[0].substring(0, 18);
+    text += `${c.name} | 0${c.phone}\n${shortProduct} | ${daysUntil(c.expiry_date)}d left\n\n`;
+  });
+
+  const buttons = [];
+  if (page > 0) buttons.push({ text: '◀️ Prev', callback_data: `exp_${page - 1}` });
+  if (page < totalPages - 1) buttons.push({ text: 'Next ▶️', callback_data: `exp_${page + 1}` });
+
+  const opts = buttons.length ? { reply_markup: { inline_keyboard: [buttons] } } : {};
+  return bot.sendMessage(chatId, text, opts);
+}
 
 bot.onText(/\/expiring/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT * FROM customers WHERE expiry_date >= date('now') AND expiry_date <= date('now','+7 days') ORDER BY expiry_date ASC`).all();
-  if (!rows.length) return bot.sendMessage(msg.chat.id, '✅ No one expiring this week!');
-  let text = `⚠️ *Expiring This Week (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach(c => { text += `👤 ${c.name} | 📱 0${c.phone}\n📦 ${c.product} | ⏰ ${daysUntil(c.expiry_date)}d\n\n`; });
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  showExpiringPage(msg.chat.id, 0);
 });
+
+const todayPages = {};
+
+function showTodayPage(chatId, page = 0) {
+  const PAGE_SIZE = 5;
+  const allRows = db.prepare(`SELECT * FROM customers WHERE start_date = date('now') ORDER BY product, created_at DESC`).all();
+  if (!allRows.length) return bot.sendMessage(chatId, 'No orders today.');
+
+  const total = allRows.reduce((s, c) => s + c.store_amount, 0);
+  const totalPages = Math.ceil(allRows.length / PAGE_SIZE);
+  const rows = allRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  let text = `Today: ${allRows.length} orders | Total: ৳${total.toFixed(0)}\n`;
+  text += `Page ${page + 1}/${totalPages}\n`;
+  text += '━━━━━━━━━━━━━━━━━━\n';
+
+  let lastProduct = '';
+  rows.forEach((c) => {
+    const shortProduct = c.product.split(' - ')[0].split(' |')[0].substring(0, 18);
+    if (shortProduct !== lastProduct) {
+      text += `\n📦 ${shortProduct}\n`;
+      lastProduct = shortProduct;
+    }
+    text += `${c.name} | ৳${c.store_amount}\n`;
+  });
+
+  const buttons = [];
+  if (page > 0) buttons.push({ text: '◀️ Prev', callback_data: `today_${page - 1}` });
+  if (page < totalPages - 1) buttons.push({ text: 'Next ▶️', callback_data: `today_${page + 1}` });
+
+  const opts = buttons.length ? { reply_markup: { inline_keyboard: [buttons] } } : {};
+  return bot.sendMessage(chatId, text, opts);
+}
 
 bot.onText(/\/today/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT * FROM customers WHERE start_date = date('now') ORDER BY created_at DESC`).all();
-  if (!rows.length) return bot.sendMessage(msg.chat.id, '📭 No orders today.');
-  const total = rows.reduce((s, c) => s + c.store_amount, 0);
-  let text = `📅 *Today (${rows.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => { text += `${i+1}. ${c.name} — ${c.product} — ৳${c.store_amount}\n`; });
-  text += `━━━━━━━━━━━━━━━━━━\n💰 Total: ৳${total.toFixed(2)}`;
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  showTodayPage(msg.chat.id, 0);
 });
 
 bot.onText(/\/revenue/, (msg) => {
@@ -447,6 +522,32 @@ bot.onText(/\/top/, (msg) => {
   let text = `🏆 *Top Customers*\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach((c, i) => { text += `${i+1}. ${c.name} | 0${c.phone}\n🔄 ${c.r}x | ৳${c.spent.toFixed(2)}\n\n`; });
   bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+
+// Pagination callbacks
+bot.on('callback_query', async (query) => {
+  const data = query.data;
+  const chatId = query.message.chat.id;
+  if (!isOwner(query.message)) return;
+
+  if (data.startsWith('cust_')) {
+    const page = parseInt(data.split('_')[1]);
+    await bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
+    await showCustomerPage(chatId, page);
+    await bot.answerCallbackQuery(query.id);
+  }
+  if (data.startsWith('today_')) {
+    const page = parseInt(data.split('_')[1]);
+    await bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
+    await showTodayPage(chatId, page);
+    await bot.answerCallbackQuery(query.id);
+  }
+  if (data.startsWith('exp_')) {
+    const page = parseInt(data.split('_')[1]);
+    await bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
+    await showExpiringPage(chatId, page);
+    await bot.answerCallbackQuery(query.id);
+  }
 });
 
 bot.onText(/\/pending/, (msg) => {
