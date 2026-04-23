@@ -11,7 +11,11 @@ const axios       = require('axios');
 const crypto      = require('crypto');
 const config      = require('./config');
 
-const db = new Database('/app/data/fanflix.db');
+const fs = require('fs');
+const DB_DIR = '/app/data';
+const DB_PATH = '/app/data/fanflix.db';
+if (!fs.existsSync(DB_DIR)) { fs.mkdirSync(DB_DIR, { recursive: true }); }
+const db = new Database(DB_PATH);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
