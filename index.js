@@ -25,6 +25,9 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
 
+// Add missing columns for existing databases
+try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled INTEGER DEFAULT 0`); } catch(e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,12 +120,6 @@ async function sendAutoDelete(chatId, text, opts = {}) {
     }, 60 * 1000);
     return sent;
   } catch(e) { console.error('sendAutoDelete:', e.message); }
-}
-
-async function deleteUserMessage(chatId, messageId) {
-  try {
-    await bot.deleteMessage(chatId, messageId);
-  } catch(e) {}
 }
 
 function isOwner(msg) {
@@ -553,7 +550,6 @@ bot.on('callback_query', async (query) => {
 
 bot.onText(/\/start/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   sendAutoDelete(msg.chat.id,
     `FanFlix Bot v5.1\n\n` +
     `Commands:\n` +
@@ -575,25 +571,21 @@ bot.onText(/\/start/, async (msg) => {
 
 bot.onText(/\/customers/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   showCustomerPage(msg.chat.id, 0);
 });
 
 bot.onText(/\/expiring/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   showExpiringPage(msg.chat.id, 0);
 });
 
 bot.onText(/\/today/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   showTodayPage(msg.chat.id, 0);
 });
 
 bot.onText(/\/revenue/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const t = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = date('now')`).get();
   const w = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-7 days')`).get();
   const m = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','-30 days')`).get();
@@ -607,7 +599,6 @@ bot.onText(/\/revenue/, async (msg) => {
 
 bot.onText(/\/stats/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const active  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= date('now')`).get();
   const expired = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date < date('now')`).get();
   const onetime = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date IS NULL`).get();
@@ -626,7 +617,6 @@ bot.onText(/\/stats/, async (msg) => {
 
 bot.onText(/\/product/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const rows = db.prepare(`SELECT product, COUNT(*) AS cnt, SUM(store_amount) AS rev FROM customers GROUP BY product ORDER BY cnt DESC`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
   let text = `Sales by Product\n━━━━━━━━━━━━━━━━━━\n`;
@@ -636,7 +626,6 @@ bot.onText(/\/product/, async (msg) => {
 
 bot.onText(/\/retention/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const total   = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers`).get();
   const renewed = db.prepare(`SELECT COUNT(DISTINCT phone) AS cnt FROM customers WHERE renewal_count > 1`).get();
   const rate    = total.cnt > 0 ? Math.round((renewed.cnt / total.cnt) * 100) : 0;
@@ -648,7 +637,6 @@ bot.onText(/\/retention/, async (msg) => {
 
 bot.onText(/\/top/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS r, SUM(store_amount) AS spent FROM customers GROUP BY phone ORDER BY r DESC LIMIT 10`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
   let text = `Top Customers\n━━━━━━━━━━━━━━━━━━\n`;
@@ -658,7 +646,6 @@ bot.onText(/\/top/, async (msg) => {
 
 bot.onText(/\/pending/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const rows = db.prepare(`SELECT * FROM unmatched_payments WHERE created_at >= datetime('now', '-2 days') ORDER BY created_at DESC`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No unmatched payments in last 2 days.');
   let text = `Unmatched Payments\n━━━━━━━━━━━━━━━━━━\n`;
@@ -674,7 +661,6 @@ bot.onText(/\/pending/, async (msg) => {
 
 bot.onText(/\/unpaid/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const rows = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND date(created_at) = date('now') ORDER BY created_at ASC`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No unpaid orders today.');
   let text = `Unpaid Orders Today (${rows.length})\n━━━━━━━━━━━━━━━━━━\n`;
@@ -686,7 +672,6 @@ bot.onText(/\/unpaid/, async (msg) => {
 
 bot.onText(/\/export/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   const rows = db.prepare(`SELECT * FROM customers ORDER BY created_at DESC`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
   let csv = 'Name,Phone,Email,Product,Type,Amount,Start,Expiry,Renewals,VIP\n';
@@ -699,7 +684,6 @@ bot.onText(/\/export/, async (msg) => {
 
 bot.onText(/\/exportcontacts/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   if (!fs.existsSync(CONTACTS_FILE)) return sendAutoDelete(msg.chat.id, 'No contacts yet.');
   const sent = await bot.sendDocument(msg.chat.id, CONTACTS_FILE, {}, { filename: `fanflix_contacts_${today()}.txt`, contentType: 'text/plain' });
   setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
@@ -709,7 +693,6 @@ bot.onText(/\/exportcontacts/, async (msg) => {
 const editState = {};
 bot.onText(/\/edit/, async (msg) => {
   if (!isOwner(msg)) return;
-  await deleteUserMessage(msg.chat.id, msg.message_id);
   editState[msg.chat.id] = { step: 'phone' };
   sendAutoDelete(msg.chat.id, 'Enter phone number to edit:');
 });
@@ -721,8 +704,7 @@ bot.on('message', async (msg) => {
   if (text.startsWith('/')) return;
 
   if (editState[cid]) {
-    await deleteUserMessage(cid, msg.message_id);
-    const s = editState[cid];
+      const s = editState[cid];
     if (s.step === 'phone') {
       const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
       if (!c) { delete editState[cid]; return sendAutoDelete(cid, 'Customer not found.'); }
