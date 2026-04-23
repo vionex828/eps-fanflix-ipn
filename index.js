@@ -1,3 +1,4 @@
+process.env.TZ = 'Asia/Dhaka';
 // =============================================
 //   FANFLIX BOT v4.0 - FINAL CLEAN VERSION
 // =============================================
@@ -577,8 +578,8 @@ cron.schedule('0 9 * * *', async () => {
   }
 });
 
-// 10 PM - tomorrow expiry + unpaid orders + bulk followup SMS
-cron.schedule('0 22 * * *', async () => {
+// 7 PM - tomorrow expiry + unpaid orders + bulk followup SMS
+cron.schedule('0 19 * * *', async () => {
   try {
     const tomorrow = db.prepare(`SELECT * FROM customers WHERE expiry_date = date('now','+1 day')`).all();
     if (tomorrow.length) {
@@ -587,7 +588,7 @@ cron.schedule('0 22 * * *', async () => {
       await sendTelegram(text);
     }
 
-    const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND date(created_at) = date('now') ORDER BY created_at ASC`).all();
+    const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND followup_sent >= 1 AND date(created_at) >= date('now', '-2 days') ORDER BY created_at ASC`).all();
     if (unpaid.length) {
       let text = `📋 *Unpaid Orders Today (${unpaid.length})*\n━━━━━━━━━━━━━━━━━━\n`;
       unpaid.forEach((o, i) => { text += `${i+1}. ${o.order_name} — ${o.name}\n📦 ${o.product}\n💰 ৳${o.amount}\n\n`; });
@@ -601,10 +602,14 @@ cron.schedule('0 22 * * *', async () => {
         } catch(e) { console.error('Followup SMS:', e.message); }
       }
       // Show order IDs to cancel
-      let cancelText = `❌ *Still Unpaid — Cancel These Orders:*\n━━━━━━━━━━━━━━━━━━\n`;
-      unpaid.forEach((o, i) => { cancelText += `${i+1}\. ${esc(o.order_name)}\n`; });
-      cancelText += `\nCancel manually on Shopify\.`;
-      await sendTelegram(cancelText);
+      let cancelText = `❌ *Still Unpaid — Cancel These Orders:*
+━━━━━━━━━━━━━━━━━━
+`;
+      unpaid.forEach((o, i) => { cancelText += `${i+1}. ${o.order_name}
+`; });
+      cancelText += `
+Cancel manually on Shopify.`;
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, cancelText);
     }
   } catch(e) { console.error('10PM:', e.message); }
 });
