@@ -27,7 +27,9 @@ const db = new Database(DB_PATH);
 
 // Migrations for existing DB
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE pending_orders ADD COLUMN products TEXT DEFAULT '[]'`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
@@ -1003,6 +1005,7 @@ cron.schedule('0 10 1 * *', async () => {
 
 app.listen(config.PORT, async () => {
   console.log(`FanFlix Bot v5.3 on port ${config.PORT}`);
-  await refreshShopifyToken();
+  // Refresh token silently - don't crash on failure
+  refreshShopifyToken().catch(e => console.error('Initial token refresh:', e.message));
   safeSend('🚀 *FanFlix Bot v5.3 Started!*').catch(() => {});
 });
