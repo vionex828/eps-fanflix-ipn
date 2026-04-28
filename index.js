@@ -113,7 +113,7 @@ const SMS_MSG1 = (product) =>
   `প্রিয় গ্রাহক,\n\nআপনার ${product} সাবস্ক্রিপশনটি আগামীকাল মেয়াদ শেষ হবে।\n\nসার্ভিস বন্ধ হওয়ার আগেই রিনিউ করুন।\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
 
 const SMS_DISCOUNT =
-  `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি।\n\n🎁 আপনার জন্য বিশেষ ১০% ছাড়!\n\nকোড ব্যবহার করুন: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\nfanflixbd.com\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
+  `প্রিয় গ্রাহক,\nআপনি আগে FanFlix থেকে অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি।\n🎁 আপনার জন্য বিশেষ ১০% ছাড়!\nকোড ব্যবহার করুন: WELCOMEBACK10\nএখনই অর্ডার করুন:\nfanflixbd.com\nWhatsApp: wa.me/+8801928382918\n— FanFlix BD`;
 
 const SMS_FOLLOWUP =
   `প্রিয় গ্রাহক,\n\nআপনার অর্ডারটি এখনো সম্পন্ন হয়নি। পেমেন্ট না হওয়ায় অর্ডারটি পেন্ডিং অবস্থায় রয়েছে।\n\nপেমেন্ট করুন:\nhttps://pg.eps.com.bd/DefaultPaymentLink?id=805A9AEE\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
@@ -701,10 +701,10 @@ bot.onText(/\/start/, (msg) => {
     `/pending - Unmatched payments\n` +
     `/unpaid - Unpaid orders today\n` +
     `/edit - Edit expiry date\n` +
-    `/cancelled - Cancelled orders history\n` +
+    `/history 01874... - Customer history\n` +
+    `/cancelled - Cancelled orders\n` +
     `/export - Export customers CSV\n` +
-    `/exportcontacts - Export contacts\n` +
-    `/setdiscount - Set discount SMS`
+    `/exportcontacts - Export contacts`
   );
 });
 
@@ -718,11 +718,18 @@ bot.onText(/\/revenue/, (msg) => {
   const t = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = ?`).get(todayStr);
   const w = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date(?, '-7 days')`).get(todayStr);
   const m = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date(?, '-30 days')`).get(todayStr);
+  const todayStr2 = today();
+  const lostToday = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND date(cancelled_at, '+6 hours') = ?`).get(todayStr2);
+  const lostMonth = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND cancelled_at >= datetime('now', '-30 days')`).get();
+
   sendAutoDelete(msg.chat.id,
     `Revenue Report\n━━━━━━━━━━━━━━━━━━\n` +
     `Today: ৳${t.total.toFixed(0)} (${t.cnt} orders)\n` +
     `Week:  ৳${w.total.toFixed(0)} (${w.cnt} orders)\n` +
-    `Month: ৳${m.total.toFixed(0)} (${m.cnt} orders)`
+    `Month: ৳${m.total.toFixed(0)} (${m.cnt} orders)\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `❌ Lost Today: ৳${lostToday.total.toFixed(0)} (${lostToday.cnt} cancelled)\n` +
+    `❌ Lost Month: ৳${lostMonth.total.toFixed(0)} (${lostMonth.cnt} cancelled)`
   );
 });
 
@@ -872,22 +879,47 @@ bot.onText(/\/cancelled/, (msg) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /setdiscount
-bot.onText(/\/setdiscount/, (msg) => {
+
+// /history
+bot.onText(/\/history (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
-  const currentDiscount = db.prepare(`SELECT value FROM settings WHERE key = 'discount_sms'`).get();
-  const current = currentDiscount ? currentDiscount.value : SMS_DISCOUNT;
-  bot.sendMessage(msg.chat.id, `Current discount SMS:\n\n${current}\n\nSend new message (use {code} for discount code):`)
-    .then(sent => {
-      setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
+  const phone = normalizePhone(match[1].trim());
+
+  const orders    = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC`).all(phone);
+  const cancelled = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND cancelled = 1 ORDER BY cancelled_at DESC`).all(phone);
+  const unpaid    = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC`).all(phone);
+
+  if (!orders.length && !cancelled.length) return sendAutoDelete(msg.chat.id, 'No history found for this number.');
+
+  let text = `📋 Customer History | 0${phone}\n━━━━━━━━━━━━━━━━━━\n`;
+
+  if (orders.length) {
+    const totalSpent = orders.reduce((s, o) => s + (o.store_amount || 0), 0);
+    text += `\n✅ Orders (${orders.length}) | ৳${totalSpent.toFixed(0)}\n`;
+    orders.slice(0, 5).forEach(o => {
+      text += `${o.order_name} | ${o.product}\n`;
+      text += `৳${o.store_amount || 0} | ${formatDate(o.start_date)}\n`;
+      if (o.expiry_date) text += `Expires: ${formatDate(o.expiry_date)}\n`;
+      text += `\n`;
     });
-  bot.once('message', (r) => {
-    if (!isOwner(r)) return;
-    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('discount_sms', r.text);
-    bot.sendMessage(r.chat.id, 'Discount SMS updated!').then(s => {
-      setTimeout(() => bot.deleteMessage(r.chat.id, s.message_id).catch(() => {}), 60000);
+  }
+
+  if (cancelled.length) {
+    text += `❌ Cancelled (${cancelled.length})\n`;
+    cancelled.slice(0, 3).forEach(o => {
+      let products = [];
+      try { products = JSON.parse(o.products || '[]'); } catch(e) {}
+      text += `${o.order_name} | ৳${o.amount}\n`;
     });
-  });
+    text += `\n`;
+  }
+
+  if (unpaid.length) {
+    text += `⏳ Unpaid (${unpaid.length})\n`;
+    unpaid.forEach(o => { text += `${o.order_name} | ৳${o.amount}\n`; });
+  }
+
+  sendAutoDelete(msg.chat.id, text);
 });
 
 // /edit
@@ -937,15 +969,15 @@ cron.schedule('0 9 * * *', async () => {
 
     for (const c of eligible) {
       try {
-        const discountSetting = db.prepare(`SELECT value FROM settings WHERE key = 'discount_sms'`).get();
-        const smsText = discountSetting ? discountSetting.value : SMS_DISCOUNT;
-        await sendSMS(c.phone, smsText);
+        await sendSMS(c.phone, SMS_DISCOUNT);
         db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ? AND cancelled = 1`).run(c.phone);
-        await safeSend(
+        const sentMsg = await bot.sendMessage(config.TELEGRAM_CHAT_ID,
           `🎁 *Discount SMS Sent!*\n` +
           `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
-          `Code: WELCOMEBACK10`
+          `Code: WELCOMEBACK10`,
+          { parse_mode: 'Markdown' }
         );
+        setTimeout(() => bot.deleteMessage(config.TELEGRAM_CHAT_ID, sentMsg.message_id).catch(() => {}), 5 * 60 * 1000);
       } catch(e) { console.error('Discount SMS:', e.message); }
     }
   } catch(e) { console.error('Discount cron:', e.message); }
@@ -1101,6 +1133,38 @@ cron.schedule('50 23 * * *', async () => {
       `📊 Gateway Fees: ৳${gatewayFees.toFixed(0)}`
     );
   } catch(e) { console.error('Payment report:', e.message); }
+});
+
+// Every 6 hours - bot health check
+cron.schedule('0 */6 * * *', async () => {
+  try {
+    const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= ?`).get(today());
+    const unpaidC  = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 0 AND cancelled = 0`).get();
+    const dbSize   = (() => { try { const s = require('fs').statSync(DB_PATH); return (s.size / 1024 / 1024).toFixed(1) + 'MB'; } catch(e) { return 'N/A'; } })();
+    await safeSend(
+      `✅ *Bot Running Fine*\n` +
+      `👥 Active customers: ${active.cnt}\n` +
+      `📦 Pending orders: ${unpaidC.cnt}\n` +
+      `💾 DB size: ${dbSize}`
+    );
+  } catch(e) { console.error('Health check:', e.message); }
+});
+
+// Daily 8 AM - SMS balance check
+cron.schedule('0 8 * * *', async () => {
+  try {
+    const res = await axios.get('https://bulksmsbd.net/api/getBalanceApi', {
+      params: { api_key: config.SMS_API_KEY }
+    });
+    const balance = res.data?.balance || res.data?.data?.balance || 0;
+    if (parseFloat(balance) < 100) {
+      await safeSend(
+        `⚠️ *Low SMS Balance!*\n` +
+        `Remaining: ${balance} SMS\n` +
+        `Top up now to avoid missed reminders!`
+      );
+    }
+  } catch(e) { console.error('SMS balance check:', e.message); }
 });
 
 // 1st of month - growth
