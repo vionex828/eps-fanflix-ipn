@@ -33,6 +33,8 @@ try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } 
 // Backfill store_amount from amount for old records
 try { db.exec(`UPDATE customers SET store_amount = amount * 0.977 WHERE store_amount = 0 AND amount > 0`); } catch(e) {}
 try { db.exec(`UPDATE pending_orders SET products = '[]' WHERE products IS NULL`); } catch(e) {}
+try { db.exec(`ALTER TABLE pending_orders ADD COLUMN discount_sent INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled_at TEXT`); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
@@ -109,6 +111,9 @@ const SMS_MSG3 = (product) =>
 
 const SMS_MSG1 = (product) =>
   `প্রিয় গ্রাহক,\n\nআপনার ${product} সাবস্ক্রিপশনটি আগামীকাল মেয়াদ শেষ হবে।\n\nসার্ভিস বন্ধ হওয়ার আগেই রিনিউ করুন।\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
+
+const SMS_DISCOUNT =
+  `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি।\n\n🎁 আপনার জন্য বিশেষ ১০% ছাড়!\n\nকোড ব্যবহার করুন: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\nfanflixbd.com\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
 
 const SMS_FOLLOWUP =
   `প্রিয় গ্রাহক,\n\nআপনার অর্ডারটি এখনো সম্পন্ন হয়নি। পেমেন্ট না হওয়ায় অর্ডারটি পেন্ডিং অবস্থায় রয়েছে।\n\nপেমেন্ট করুন:\nhttps://pg.eps.com.bd/DefaultPaymentLink?id=805A9AEE\n\nWhatsApp: wa.me/+8801928382918\n\n— FanFlix BD`;
@@ -399,7 +404,7 @@ app.post('/shopify-cancel', async (req, res) => {
     const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(oid);
     if (!pending) return;
     saveContact(pending.phone, pending.name);
-    db.prepare('UPDATE pending_orders SET cancelled = 1 WHERE shopify_order_id = ?').run(oid);
+    db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE shopify_order_id = ?').run(oid);
     await safeSend(
       `🚫 *Order Cancelled*\n` +
       `👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n` +
@@ -696,8 +701,10 @@ bot.onText(/\/start/, (msg) => {
     `/pending - Unmatched payments\n` +
     `/unpaid - Unpaid orders today\n` +
     `/edit - Edit expiry date\n` +
+    `/cancelled - Cancelled orders history\n` +
     `/export - Export customers CSV\n` +
-    `/exportcontacts - Export contacts`
+    `/exportcontacts - Export contacts\n` +
+    `/setdiscount - Set discount SMS`
   );
 });
 
@@ -819,6 +826,70 @@ bot.onText(/\/exportcontacts/, async (msg) => {
   setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
 });
 
+// /cancelled
+bot.onText(/\/cancelled/, (msg) => {
+  if (!isOwner(msg)) return;
+
+  const allTime  = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1`).get();
+  const last30   = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND cancelled_at >= datetime('now', '-30 days')`).get();
+  const last7    = db.prepare(`SELECT * FROM pending_orders WHERE cancelled = 1 AND cancelled_at >= datetime('now', '-7 days') ORDER BY cancelled_at DESC LIMIT 20`).all();
+
+  // Peak cancel time
+  const peakHour = db.prepare(`SELECT strftime('%H', cancelled_at) AS hr, COUNT(*) AS cnt FROM pending_orders WHERE cancelled = 1 AND cancelled_at IS NOT NULL GROUP BY hr ORDER BY cnt DESC LIMIT 1`).get();
+  const peakTime = peakHour ? `${parseInt(peakHour.hr)}:00 - ${parseInt(peakHour.hr)+1}:00` : 'N/A';
+
+  // Re-order rate: cancelled customers who later placed a paid order
+  const cancelledPhones = db.prepare(`SELECT DISTINCT phone FROM pending_orders WHERE cancelled = 1`).all().map(r => r.phone);
+  let reorderCount = 0;
+  cancelledPhones.forEach(phone => {
+    const reordered = db.prepare(`SELECT id FROM customers WHERE phone = ?`).get(phone);
+    if (reordered) reorderCount++;
+  });
+  const reorderRate = cancelledPhones.length > 0 ? Math.round((reorderCount / cancelledPhones.length) * 100) : 0;
+
+  let text = `🚫 Cancelled Orders\n━━━━━━━━━━━━━━━━━━\n`;
+  text += `📊 All Time: ${allTime.cnt} | ৳${allTime.total.toFixed(0)}\n`;
+  text += `📊 Last 30 days: ${last30.cnt} | ৳${last30.total.toFixed(0)}\n`;
+  text += `⏰ Peak Cancel Time: ${peakTime}\n`;
+  text += `🔄 Re-order Rate: ${reorderRate}%\n`;
+  text += `━━━━━━━━━━━━━━━━━━\n`;
+
+  if (last7.length) {
+    text += `Recent ${last7.length} (Last 7 days):\n\n`;
+    last7.forEach((o, i) => {
+      let products = [];
+      try { products = JSON.parse(o.products || '[]'); } catch(e) {}
+      const productNames = products.map(p => p.name).join(', ') || 'Unknown';
+      const cancelTime = o.cancelled_at ? new Date(o.cancelled_at).toLocaleString('en-BD', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true }) : 'N/A';
+      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
+      text += `📦 ${productNames} | ৳${o.amount}\n`;
+      text += `⏰ ${cancelTime}\n\n`;
+    });
+  } else {
+    text += `No cancellations in last 7 days ✅`;
+  }
+
+  sendAutoDelete(msg.chat.id, text);
+});
+
+// /setdiscount
+bot.onText(/\/setdiscount/, (msg) => {
+  if (!isOwner(msg)) return;
+  const currentDiscount = db.prepare(`SELECT value FROM settings WHERE key = 'discount_sms'`).get();
+  const current = currentDiscount ? currentDiscount.value : SMS_DISCOUNT;
+  bot.sendMessage(msg.chat.id, `Current discount SMS:\n\n${current}\n\nSend new message (use {code} for discount code):`)
+    .then(sent => {
+      setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
+    });
+  bot.once('message', (r) => {
+    if (!isOwner(r)) return;
+    db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('discount_sms', r.text);
+    bot.sendMessage(r.chat.id, 'Discount SMS updated!').then(s => {
+      setTimeout(() => bot.deleteMessage(r.chat.id, s.message_id).catch(() => {}), 60000);
+    });
+  });
+});
+
 // /edit
 const editState = {};
 bot.onText(/\/edit/, (msg) => {
@@ -852,6 +923,33 @@ bot.on('message', (msg) => {
 // =============================================================
 //  SCHEDULED TASKS
 // =============================================================
+
+// 9 AM daily - send discount SMS to cancelled customers after 7 days
+cron.schedule('0 9 * * *', async () => {
+  try {
+    const eligible = db.prepare(`
+      SELECT DISTINCT p.phone, p.name FROM pending_orders p
+      WHERE p.cancelled = 1
+      AND p.discount_sent = 0
+      AND p.cancelled_at <= datetime('now', '-7 days')
+      AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
+    `).all();
+
+    for (const c of eligible) {
+      try {
+        const discountSetting = db.prepare(`SELECT value FROM settings WHERE key = 'discount_sms'`).get();
+        const smsText = discountSetting ? discountSetting.value : SMS_DISCOUNT;
+        await sendSMS(c.phone, smsText);
+        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ? AND cancelled = 1`).run(c.phone);
+        await safeSend(
+          `🎁 *Discount SMS Sent!*\n` +
+          `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
+          `Code: WELCOMEBACK10`
+        );
+      } catch(e) { console.error('Discount SMS:', e.message); }
+    }
+  } catch(e) { console.error('Discount cron:', e.message); }
+});
 
 // 7 PM - renewals + follow-up + lost alerts + auto-cancel scheduling
 cron.schedule('0 19 * * *', async () => {
@@ -927,7 +1025,7 @@ cron.schedule('0 19 * * *', async () => {
       for (const o of stillUnpaid) {
         try {
           await cancelShopifyOrder(o.shopify_order_id);
-          db.prepare('UPDATE pending_orders SET cancelled = 1 WHERE id=?').run(o.id);
+          db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE id=?').run(o.id);
           saveContact(o.phone, o.name);
           cancelText += `${o.order_name} — ${cleanText(o.name)} | ৳${o.amount}\n`;
           cancelCount++;
