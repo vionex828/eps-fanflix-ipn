@@ -30,6 +30,9 @@ try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled INTEGER DEFAULT 0
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN products TEXT DEFAULT '[]'`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
+// Backfill store_amount from amount for old records
+try { db.exec(`UPDATE customers SET store_amount = amount * 0.977 WHERE store_amount = 0 AND amount > 0`); } catch(e) {}
+try { db.exec(`UPDATE pending_orders SET products = '[]' WHERE products IS NULL`); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
@@ -365,12 +368,16 @@ app.post('/shopify-order', async (req, res) => {
       try {
         await sendSMS(phone, SMS_FOLLOWUP);
         db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(String(o.id));
-        await safeSend(
-          `⏰ *Follow-up SMS Sent!*\n` +
-          `👤 ${cleanText(name)} | 📱 0${phone}\n` +
-          `🛒 ${o.name}\n` +
-          `💰 ৳${amount}`
-        );
+        try {
+          const fMsg = await bot.sendMessage(config.TELEGRAM_CHAT_ID,
+            `⏰ *Follow-up SMS Sent!*\n` +
+            `👤 ${cleanText(name)} | 📱 0${phone}\n` +
+            `🛒 ${o.name}\n` +
+            `💰 ৳${amount}`,
+            { parse_mode: 'Markdown' }
+          );
+          setTimeout(() => bot.deleteMessage(config.TELEGRAM_CHAT_ID, fMsg.message_id).catch(() => {}), 5 * 60 * 1000);
+        } catch(e) { console.error('Followup notify:', e.message); }
       } catch(e) {
         console.error('1hr followup:', e.message);
         await safeSend(`❌ *Follow-up SMS Failed!*\n👤 ${cleanText(name)} | 📱 0${phone}\nError: ${e.message}`);
@@ -418,20 +425,25 @@ app.post('/eps-ipn', async (req, res) => {
 
     // Failed payment
     if (p.status !== 'Success') {
-      await safeSend(
-        `❌ *Failed Payment — FanFlix*\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `👤 Name: ${cleanText(p.customerName)}\n` +
-        `📱 Phone: ${p.customerPhone || 'N/A'}\n` +
-        `📧 Email: ${p.customerEmail || 'N/A'}\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `💰 Amount: ৳${p.totalAmount}\n` +
-        `💳 Method: ${p.financialEntity || 'N/A'}\n` +
-        `📋 Status: ${p.status}\n` +
-        `🔖 Reference: ${p.merchantTransactionId || 'N/A'}\n` +
-        `🕐 Time: ${formatEPSTime(p.transactionDate)}\n` +
-        `━━━━━━━━━━━━━━━━━━`
-      );
+      // Auto-delete failed payment after 5 mins
+      try {
+        const failMsg = await bot.sendMessage(config.TELEGRAM_CHAT_ID,
+          `❌ *Failed Payment — FanFlix*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `👤 Name: ${cleanText(p.customerName)}\n` +
+          `📱 Phone: ${p.customerPhone || 'N/A'}\n` +
+          `📧 Email: ${p.customerEmail || 'N/A'}\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `💰 Amount: ৳${p.totalAmount}\n` +
+          `💳 Method: ${p.financialEntity || 'N/A'}\n` +
+          `📋 Status: ${p.status}\n` +
+          `🔖 Reference: ${p.merchantTransactionId || 'N/A'}\n` +
+          `🕐 Time: ${formatEPSTime(p.transactionDate)}\n` +
+          `━━━━━━━━━━━━━━━━━━`,
+          { parse_mode: 'Markdown' }
+        );
+        setTimeout(() => bot.deleteMessage(config.TELEGRAM_CHAT_ID, failMsg.message_id).catch(() => {}), 5 * 60 * 1000);
+      } catch(e) { console.error('Failed payment notify:', e.message); }
       // Save failed payment for daily report
       db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, store_amount, status) VALUES (?, ?, ?, ?, ?)')
         .run(p.epsTransactionId || '', normalizePhone(p.customerPhone || ''), parseFloat(p.totalAmount || 0), 0, p.status);
@@ -773,7 +785,8 @@ bot.onText(/\/pending/, (msg) => {
 bot.onText(/\/unpaid/, (msg) => {
   if (!isOwner(msg)) return;
   const todayStr = today();
-  const rows = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND date(created_at, '+6 hours') = ? ORDER BY created_at ASC`).all(todayStr);
+  // BD is UTC+6, so subtract 6 hours from created_at to get UTC, then add 6 to compare
+  const rows = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND datetime(created_at, '+6 hours') >= ? AND datetime(created_at, '+6 hours') < ? ORDER BY created_at ASC`).all(todayStr + ' 00:00:00', todayStr + ' 23:59:59');
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No unpaid orders today.');
   let text = `Unpaid Orders Today (${rows.length})\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach((o, i) => {
@@ -904,20 +917,23 @@ cron.schedule('0 19 * * *', async () => {
     }
 
     // Schedule auto-cancel 1 hour after 2nd follow-up
+    const cancelDateStr = todayStr; // capture current date before timeout
     setTimeout(async () => {
-      const stillUnpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND followup_sent >= 2 AND date(created_at, '+6 hours') >= date(?, '-2 days')`).all(todayStr);
+      const stillUnpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND followup_sent >= 2`).all();
       if (!stillUnpaid.length) return;
 
       let cancelText = `🚫 *Auto-Cancelled ${stillUnpaid.length} Unpaid Orders:*\n━━━━━━━━━━━━━━━━━━\n`;
+      let cancelCount = 0;
       for (const o of stillUnpaid) {
         try {
           await cancelShopifyOrder(o.shopify_order_id);
           db.prepare('UPDATE pending_orders SET cancelled = 1 WHERE id=?').run(o.id);
           saveContact(o.phone, o.name);
-          cancelText += `${o.order_name} — ${cleanText(o.name)}\n`;
+          cancelText += `${o.order_name} — ${cleanText(o.name)} | ৳${o.amount}\n`;
+          cancelCount++;
         } catch(e) { console.error('Auto-cancel:', e.message); }
       }
-      await safeSend(cancelText);
+      if (cancelCount > 0) await safeSend(cancelText);
     }, 60 * 60 * 1000); // 1 hour after 2nd followup
   }
 
