@@ -701,6 +701,7 @@ bot.onText(/\/start/, (msg) => {
     `/pending - Unmatched payments\n` +
     `/unpaid - Unpaid orders today\n` +
     `/edit - Edit expiry date\n` +
+    `/cancel fanflix35684 - Cancel order\n` +
     `/history 01874... - Customer history\n` +
     `/cancelled - Cancelled orders\n` +
     `/export - Export customers CSV\n` +
@@ -838,8 +839,8 @@ bot.onText(/\/cancelled/, (msg) => {
   if (!isOwner(msg)) return;
 
   const allTime  = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1`).get();
-  const last30   = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND cancelled_at >= datetime('now', '-30 days')`).get();
-  const last7    = db.prepare(`SELECT * FROM pending_orders WHERE cancelled = 1 AND cancelled_at >= datetime('now', '-7 days') ORDER BY cancelled_at DESC LIMIT 20`).all();
+  const last30   = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND (cancelled_at >= datetime('now', '-30 days') OR cancelled_at IS NULL)`).get();
+  const last7    = db.prepare(`SELECT * FROM pending_orders WHERE cancelled = 1 AND (cancelled_at >= datetime('now', '-7 days') OR cancelled_at IS NULL) ORDER BY COALESCE(cancelled_at, created_at) DESC LIMIT 20`).all();
 
   // Peak cancel time
   const peakHour = db.prepare(`SELECT strftime('%H', cancelled_at) AS hr, COUNT(*) AS cnt FROM pending_orders WHERE cancelled = 1 AND cancelled_at IS NOT NULL GROUP BY hr ORDER BY cnt DESC LIMIT 1`).get();
@@ -879,6 +880,37 @@ bot.onText(/\/cancelled/, (msg) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
+
+// /cancel - manual cancel order
+bot.onText(/\/cancel (.+)/, async (msg, match) => {
+  if (!isOwner(msg)) return;
+  const orderName = match[1].trim().toUpperCase();
+
+  const pending = db.prepare(`SELECT * FROM pending_orders WHERE UPPER(order_name) = ? AND cancelled = 0`).get(orderName);
+  if (!pending) return sendAutoDelete(msg.chat.id, `Order ${orderName} not found or already cancelled.`);
+
+  db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE id = ?').run(pending.id);
+  saveContact(pending.phone, pending.name);
+
+  let products = [];
+  try { products = JSON.parse(pending.products || '[]'); } catch(e) {}
+  const productNames = products.map(p => p.name).join(', ') || 'Unknown';
+
+  const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
+  let text = `🚫 *Order Cancelled*\n` +
+    `👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n` +
+    `🛒 ${pending.order_name}\n` +
+    `📦 ${productNames}\n` +
+    `💰 ৳${pending.amount}\n` +
+    `📱 Phone saved to contacts ✅`;
+
+  if (cancelCount.cnt >= 2) {
+    const totalLost = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
+    text += `\n⚠️ Repeat Canceller! (${cancelCount.cnt}x) | Lost: ৳${totalLost.total.toFixed(0)}`;
+  }
+
+  sendAutoDelete(msg.chat.id, text);
+});
 
 // /history
 bot.onText(/\/history (.+)/, (msg, match) => {
@@ -1135,18 +1167,19 @@ cron.schedule('50 23 * * *', async () => {
   } catch(e) { console.error('Payment report:', e.message); }
 });
 
-// Every 6 hours - bot health check
+// Every 6 hours - bot health check (only alert if issues)
 cron.schedule('0 */6 * * *', async () => {
   try {
-    const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= ?`).get(today());
-    const unpaidC  = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 0 AND cancelled = 0`).get();
-    const dbSize   = (() => { try { const s = require('fs').statSync(DB_PATH); return (s.size / 1024 / 1024).toFixed(1) + 'MB'; } catch(e) { return 'N/A'; } })();
-    await safeSend(
-      `✅ *Bot Running Fine*\n` +
-      `👥 Active customers: ${active.cnt}\n` +
-      `📦 Pending orders: ${unpaidC.cnt}\n` +
-      `💾 DB size: ${dbSize}`
-    );
+    const unpaidC = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND datetime(created_at, '+6 hours') < datetime('now', '-3 hours')`).get();
+    const dbSize  = (() => { try { const s = fs.statSync(DB_PATH); return s.size / 1024 / 1024; } catch(e) { return 0; } })();
+    // Only alert if something needs attention
+    if (unpaidC.cnt > 10 || dbSize > 400) {
+      await safeSend(
+        `⚠️ *Bot Health Alert*\n` +
+        `📦 Old unpaid orders: ${unpaidC.cnt}\n` +
+        `💾 DB size: ${dbSize.toFixed(1)}MB`
+      );
+    }
   } catch(e) { console.error('Health check:', e.message); }
 });
 
@@ -1183,7 +1216,40 @@ cron.schedule('0 10 1 * *', async () => {
 
 app.listen(config.PORT, async () => {
   console.log(`FanFlix Bot v5.3 on port ${config.PORT}`);
-  // Refresh token silently - don't crash on failure
   refreshShopifyToken().catch(e => console.error('Initial token refresh:', e.message));
+
+  // Reschedule pending follow-ups lost during restart
+  try {
+    const pending = db.prepare(`
+      SELECT * FROM pending_orders
+      WHERE paid = 0 AND cancelled = 0 AND followup_sent = 0
+      AND created_at > datetime('now', '-2 hours')
+      AND created_at < datetime('now', '-50 minutes')
+    `).all();
+
+    for (const o of pending) {
+      const createdAt  = new Date(o.created_at);
+      const targetTime = new Date(createdAt.getTime() + config.FOLLOW_UP_DELAY_MS);
+      const now        = new Date();
+      const delay      = Math.max(0, targetTime - now);
+
+      setTimeout(async () => {
+        const fresh = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(o.shopify_order_id);
+        if (!fresh || fresh.paid === 1 || fresh.cancelled === 1) return;
+        try {
+          await sendSMS(o.phone, SMS_FOLLOWUP);
+          db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(o.shopify_order_id);
+          await safeSend(
+            `⏰ *Follow-up SMS Sent!*\n` +
+            `👤 ${cleanText(o.name)} | 📱 0${o.phone}\n` +
+            `🛒 ${o.order_name}\n` +
+            `💰 ৳${o.amount}`
+          );
+        } catch(e) { console.error('Rescheduled followup:', e.message); }
+      }, delay);
+    }
+    if (pending.length > 0) console.log(`Rescheduled ${pending.length} follow-ups`);
+  } catch(e) { console.error('Reschedule error:', e.message); }
+
   safeSend('🚀 *FanFlix Bot v5.3 Started!*').catch(() => {});
 });
