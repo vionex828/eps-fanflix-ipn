@@ -1,7 +1,7 @@
 process.env.TZ = 'Asia/Dhaka';
 
 // =============================================
-//   FANFLIX BOT v6.0 - COMPLETE FINAL
+//   FANFLIX BOT v6.1 - FINAL CLEAN
 // =============================================
 
 const express     = require('express');
@@ -53,7 +53,6 @@ db.exec(`
     expiry_date       TEXT,
     renewal_count     INTEGER DEFAULT 1,
     is_vip            INTEGER DEFAULT 0,
-    reminder_3_sent   INTEGER DEFAULT 0,
     reminder_1_sent   INTEGER DEFAULT 0,
     lost_alert_sent   INTEGER DEFAULT 0,
     created_at        TEXT DEFAULT CURRENT_TIMESTAMP
@@ -83,11 +82,6 @@ db.exec(`
     discount_sent    INTEGER DEFAULT 0,
     created_at       TEXT DEFAULT CURRENT_TIMESTAMP
   );
-  CREATE TABLE IF NOT EXISTS shopify_token (
-    id         INTEGER PRIMARY KEY,
-    token      TEXT,
-    updated_at TEXT
-  );
 `);
 
 // =============================================================
@@ -103,40 +97,15 @@ const SMS_FOLLOWUP =
 const SMS_DISCOUNT =
   `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে একটি অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি। আমরা আপনাকে আবার স্বাগত জানাতে চাই!\n\n🎁 শুধুমাত্র আপনার জন্য বিশেষ ১০% ছাড়!\n\nঅর্ডার করার সময় এই কোডটি ব্যবহার করুন:\n✅ কোড: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\n🌐 fanflixbd.com\n\nযেকোনো সহায়তায়:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
 
-// =============================================================
-//  SHOPIFY TOKEN
-// =============================================================
-
-let shopifyToken = null;
-
-async function refreshShopifyToken() {
-  try {
-    const res = await axios.post(
-      `https://${config.SHOPIFY_STORE}/admin/oauth/access_token`,
-      new URLSearchParams({
-        grant_type:    'client_credentials',
-        client_id:     config.SHOPIFY_CLIENT_ID,
-        client_secret: config.SHOPIFY_CLIENT_SECRET,
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    shopifyToken = res.data.access_token;
-    db.prepare('INSERT OR REPLACE INTO shopify_token (id, token, updated_at) VALUES (1, ?, ?)').run(shopifyToken, new Date().toISOString());
-    console.log('Shopify token refreshed');
-  } catch(e) {
-    console.error('Token refresh failed:', e.message);
-    const cached = db.prepare('SELECT token FROM shopify_token WHERE id = 1').get();
-    if (cached) shopifyToken = cached.token;
-  }
+// SMS time restriction: only send between 11 AM - 12:10 AM
+function canSendSMS() {
+  const hour = new Date().getHours();
+  const min  = new Date().getMinutes();
+  // Allow: 11:00 AM (11) to 12:10 AM (0:10)
+  if (hour >= 11) return true;
+  if (hour === 0 && min <= 10) return true;
+  return false;
 }
-
-function getShopifyToken() {
-  if (shopifyToken) return shopifyToken;
-  const cached = db.prepare('SELECT token FROM shopify_token WHERE id = 1').get();
-  return cached ? cached.token : null;
-}
-
-cron.schedule('0 */23 * * *', refreshShopifyToken);
 
 // =============================================================
 //  TELEGRAM
@@ -158,16 +127,6 @@ async function sendAutoDelete(chatId, text, opts = {}) {
     setTimeout(() => bot.deleteMessage(chatId, sent.message_id).catch(() => {}), 60000);
     return sent;
   } catch(e) { console.error('sendAutoDelete:', e.message); }
-}
-
-async function sendTempMsg(text, delayMs = 5 * 60 * 1000) {
-  try {
-    const sent = await bot.sendMessage(config.TELEGRAM_CHAT_ID, text, { parse_mode: 'Markdown' });
-    setTimeout(() => bot.deleteMessage(config.TELEGRAM_CHAT_ID, sent.message_id).catch(() => {}), delayMs);
-    return sent;
-  } catch(e) {
-    await bot.sendMessage(config.TELEGRAM_CHAT_ID, text.replace(/[*_`\[\]]/g, ''));
-  }
 }
 
 function isOwner(msg) {
@@ -292,7 +251,6 @@ function timeAgo(dateStr) {
   return `${Math.floor(mins/1440)}d ago`;
 }
 
-// Fuzzy name match
 function nameSimilar(a = '', b = '') {
   a = a.toLowerCase().trim();
   b = b.toLowerCase().trim();
@@ -303,11 +261,22 @@ function nameSimilar(a = '', b = '') {
   return wordsA.some(w => w.length > 2 && wordsB.includes(w));
 }
 
+function getProductNames(productsJson) {
+  try {
+    const products = JSON.parse(productsJson || '[]');
+    return products.map(p => p.name).join(', ') || 'Unknown';
+  } catch(e) { return 'Unknown'; }
+}
+
 // =============================================================
-//  SMS
+//  SMS SENDER
 // =============================================================
 
 async function sendSMS(phone, message) {
+  if (!canSendSMS()) {
+    console.log(`SMS blocked (outside hours) to ${phone}`);
+    return;
+  }
   const number = '880' + normalizePhone(phone);
   await axios.post('https://bulksmsbd.net/api/smsapi', null, {
     params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
@@ -315,48 +284,43 @@ async function sendSMS(phone, message) {
 }
 
 // =============================================================
-//  SMART ORDER MATCHING
+//  SMART MATCHING
 // =============================================================
 
 function findMatchingOrder(phone, email, name, amount) {
   const normalPhone = normalizePhone(phone);
 
-  // 1. Match by phone
+  // 1. Phone
   let order = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC LIMIT 1`).get(normalPhone);
   if (order) return { order, matchMethod: 'Phone' };
 
-  // 2. Match by email
+  // 2. Email
   if (email) {
     order = db.prepare(`SELECT * FROM pending_orders WHERE LOWER(email) = LOWER(?) AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC LIMIT 1`).get(email);
     if (order) return { order, matchMethod: 'Email' };
   }
 
-  // 3. Match by name (fuzzy)
-  const recentOrders = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-6 hours') ORDER BY created_at DESC`).all();
-  const nameMatch = recentOrders.find(o => nameSimilar(o.name, name));
+  // 3. Name (fuzzy, last 6 hours)
+  const recent = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-6 hours') ORDER BY created_at DESC`).all();
+  const nameMatch = recent.find(o => nameSimilar(o.name, name));
   if (nameMatch) return { order: nameMatch, matchMethod: 'Name' };
 
-  // 4. Match by amount within last 2 hours
-  const amountMatch = db.prepare(`SELECT * FROM pending_orders WHERE amount = ? AND paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-2 hours') ORDER BY created_at DESC LIMIT 1`).get(amount);
-  if (amountMatch) return { order: amountMatch, matchMethod: 'Amount' };
+  // 4. Amount (last 2 hours)
+  order = db.prepare(`SELECT * FROM pending_orders WHERE amount = ? AND paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-2 hours') ORDER BY created_at DESC LIMIT 1`).get(amount);
+  if (order) return { order, matchMethod: 'Amount' };
 
   return null;
 }
 
-// Suggest possible matches for unmatched payments
 function findPossibleMatches(phone, email, name, amount) {
-  const suggestions = [];
-  const recentOrders = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-24 hours') ORDER BY created_at DESC LIMIT 5`).all();
-
-  recentOrders.forEach(o => {
+  const recent = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-24 hours') ORDER BY created_at DESC LIMIT 10`).all();
+  return recent.map(o => {
     let score = 0;
     if (nameSimilar(o.name, name)) score += 3;
     if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) score += 3;
     if (Math.abs(o.amount - amount) < 1) score += 2;
-    if (score > 0) suggestions.push({ ...o, score });
-  });
-
-  return suggestions.sort((a, b) => b.score - a.score).slice(0, 2);
+    return { ...o, score };
+  }).filter(o => o.score > 0).sort((a, b) => b.score - a.score).slice(0, 2);
 }
 
 // =============================================================
@@ -373,10 +337,10 @@ app.use(express.json());
 app.post('/shopify-order', async (req, res) => {
   res.sendStatus(200);
   try {
-    const o     = req.body;
-    const phone = normalizePhone(o.phone || o.billing_address?.phone || '');
-    const name  = o.billing_address?.name || o.customer?.first_name || 'Customer';
-    const email = o.email || '';
+    const o      = req.body;
+    const phone  = normalizePhone(o.phone || o.billing_address?.phone || '');
+    const name   = o.billing_address?.name || o.customer?.first_name || 'Customer';
+    const email  = o.email || '';
     const amount = parseFloat(o.total_price || 0);
     const products = (o.line_items || []).map(li => ({ name: li.name || 'Unknown', variant: li.variant_title || '' }));
 
@@ -392,9 +356,9 @@ app.post('/shopify-order', async (req, res) => {
       const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(o.id));
       if (!pending || pending.paid === 1 || pending.cancelled === 1) return;
       try {
-        await sendSMS(phone || normalizePhone(email), SMS_FOLLOWUP);
+        await sendSMS(phone, SMS_FOLLOWUP);
         db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(String(o.id));
-        await sendTempMsg(
+        await safeSend(
           `⏰ *Follow-up SMS Sent!*\n` +
           `👤 ${cleanText(name)} | 📱 0${phone}\n` +
           `🛒 ${o.name}\n` +
@@ -402,7 +366,7 @@ app.post('/shopify-order', async (req, res) => {
         );
       } catch(e) {
         console.error('1hr followup:', e.message);
-        await sendTempMsg(`❌ *Follow-up SMS Failed!*\n👤 ${cleanText(name)} | 📱 0${phone}\nError: ${e.message}`);
+        await safeSend(`❌ *Follow-up SMS Failed!*\n👤 ${cleanText(name)} | 📱 0${phone}\nError: ${e.message}`);
       }
     }, config.FOLLOW_UP_DELAY_MS);
 
@@ -416,15 +380,23 @@ app.post('/shopify-order', async (req, res) => {
 app.post('/shopify-cancel', async (req, res) => {
   res.sendStatus(200);
   try {
-    const o   = req.body;
-    const oid = String(o.id);
+    const o       = req.body;
+    const oid     = String(o.id);
     const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(oid);
     if (!pending) return;
+
     saveContact(pending.phone, pending.name);
     db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE shopify_order_id = ?').run(oid);
 
     const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
-    let msg = `🚫 *Order Cancelled*\n👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n🛒 ${pending.order_name}\n💰 ৳${pending.amount}\n📱 Phone saved ✅`;
+    let msg =
+      `🚫 *Order Cancelled*\n` +
+      `👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n` +
+      `🛒 ${pending.order_name}\n` +
+      `📦 ${getProductNames(pending.products)}\n` +
+      `💰 ৳${pending.amount}\n` +
+      `📱 Phone saved ✅`;
+
     if (cancelCount.cnt >= 2) {
       const lost = db.prepare(`SELECT COALESCE(SUM(amount),0) AS t FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
       msg += `\n⚠️ Repeat Canceller (${cancelCount.cnt}x) | Lost: ৳${lost.t.toFixed(0)}`;
@@ -446,9 +418,9 @@ app.post('/eps-ipn', async (req, res) => {
 
     saveContact(p.customerPhone || '', p.customerName || '');
 
-    // Failed payment (auto-delete 5 mins)
+    // Failed payment
     if (p.status !== 'Success') {
-      await sendTempMsg(
+      await safeSend(
         `❌ *Failed Payment — FanFlix*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `👤 Name: ${cleanText(p.customerName)}\n` +
@@ -480,19 +452,12 @@ app.post('/eps-ipn', async (req, res) => {
     const seen = db.prepare('SELECT id FROM payments WHERE eps_txn_id = ?').get(epsTxnId);
     if (seen) return;
 
-    // Duplicate payment check
-    const recentDup = db.prepare(`SELECT id FROM payments WHERE phone = ? AND created_at > datetime('now', '-${config.DUPLICATE_WINDOW_MINUTES} minutes')`).get(normalizePhone(phone));
-    if (recentDup) {
-      await safeSend(`⚠️ *Duplicate Payment!*\n👤 ${cleanText(name)} | 📱 ${phone}\n💰 ৳${totalAmt} | 🔖 ${reference}`);
-    }
-
     db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, store_amount, status) VALUES (?, ?, ?, ?, ?)').run(epsTxnId, normalizePhone(phone), totalAmt, storeAmt, p.status);
 
-    // Smart matching: phone → email → name → amount
+    // Smart matching
     const matchResult = findMatchingOrder(phone, email, name, totalAmt);
 
     if (!matchResult) {
-      // Find possible matches for suggestions
       const suggestions = findPossibleMatches(phone, email, name, totalAmt);
       let msg =
         `💰 *New Payment — FanFlix*\n` +
@@ -509,14 +474,9 @@ app.post('/eps-ipn', async (req, res) => {
         `🕐 Time: ${time}\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `⚠️ No Shopify Order Found!`;
-
       if (suggestions.length) {
         msg += `\n\n💡 Possible matches:\n`;
-        suggestions.forEach(s => {
-          let prods = [];
-          try { prods = JSON.parse(s.products || '[]'); } catch(e) {}
-          msg += `${s.order_name} — ${cleanText(s.name)} | ৳${s.amount}\n`;
-        });
+        suggestions.forEach(s => { msg += `${s.order_name} — ${cleanText(s.name)} | ৳${s.amount}\n`; });
       }
       await safeSend(msg);
       return;
@@ -526,10 +486,15 @@ app.post('/eps-ipn', async (req, res) => {
     db.prepare('UPDATE pending_orders SET paid = 1 WHERE id = ?').run(pendingOrder.id);
 
     if (pendingOrder.followup_sent >= 1) {
-      await safeSend(`✅ *Paid After Follow-up!*\n👤 ${cleanText(name)} | 📱 ${phone}\n🛒 ${pendingOrder.order_name}\n💰 ৳${totalAmt}\n✅ Removed from unpaid list`);
+      await safeSend(
+        `✅ *Paid After Follow-up!*\n` +
+        `👤 ${cleanText(name)} | 📱 ${phone}\n` +
+        `🛒 ${pendingOrder.order_name}\n` +
+        `💰 ৳${totalAmt}\n` +
+        `✅ Removed from unpaid list`
+      );
     }
 
-    // Parse products
     let products = [];
     try { products = JSON.parse(pendingOrder.products || '[]'); } catch(e) {}
     if (!products.length) products = [{ name: 'Unknown Product', variant: '' }];
@@ -540,11 +505,10 @@ app.post('/eps-ipn', async (req, res) => {
 
     // Early renewal detection
     const earlyRenewal = products.map(li => {
-      const existing = db.prepare(`SELECT * FROM customers WHERE phone = ? AND product = ? AND expiry_date >= ? ORDER BY expiry_date ASC LIMIT 1`).get(normalizePhone(phone), li.name, today());
-      return existing ? daysUntil(existing.expiry_date) : null;
+      const ex = db.prepare(`SELECT * FROM customers WHERE phone = ? AND product = ? AND expiry_date >= ? ORDER BY expiry_date ASC LIMIT 1`).get(normalizePhone(phone), li.name, today());
+      return ex ? daysUntil(ex.expiry_date) : null;
     }).filter(d => d !== null && d <= 5);
 
-    // Save each product
     const productLines = [];
     for (const li of products) {
       const productType  = detectProductType(li.name);
@@ -591,7 +555,7 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('FanFlix Bot v6.0'));
+app.get('/', (req, res) => res.send('FanFlix Bot v6.1'));
 
 // =============================================================
 //  PAGINATION
@@ -688,7 +652,7 @@ bot.on('callback_query', async (query) => {
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   sendAutoDelete(msg.chat.id,
-    `FanFlix Bot v6.0\n\n` +
+    `FanFlix Bot v6.1\n\n` +
     `Commands:\n` +
     `/customers - Active customers\n` +
     `/expiring - Expiring this week\n` +
@@ -697,10 +661,10 @@ bot.onText(/\/start/, (msg) => {
     `/stats - Business overview\n` +
     `/product - Sales by product\n` +
     `/retention - Retention rate\n` +
-    `/top - Top customers\n` +
-    `/unpaid - Unpaid orders today\n` +
+    `/top - Top customers by spend\n` +
+    `/unpaid - Today unpaid orders\n` +
     `/cancelled - Cancelled history\n` +
-    `/search 01874 or name - Find customer\n` +
+    `/search - Find customer\n` +
     `/history 01874... - Full history\n` +
     `/cancel fanflix35684 - Cancel order\n` +
     `/edit - Edit expiry date\n` +
@@ -715,7 +679,7 @@ bot.onText(/\/today/,     (msg) => { if (!isOwner(msg)) return; showTodayPage(ms
 
 bot.onText(/\/revenue/, (msg) => {
   if (!isOwner(msg)) return;
-  const todayStr = today();
+  const todayStr  = today();
   const t = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date = ?`).get(todayStr);
   const w = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date(?, '-7 days')`).get(todayStr);
   const m = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total, COUNT(*) AS cnt FROM customers WHERE start_date >= date(?, '-30 days')`).get(todayStr);
@@ -771,15 +735,17 @@ bot.onText(/\/retention/, (msg) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
+// /top - sorted by highest spend
 bot.onText(/\/top/, (msg) => {
   if (!isOwner(msg)) return;
-  const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS r, SUM(store_amount) AS spent FROM customers GROUP BY phone ORDER BY r DESC LIMIT 10`).all();
+  const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS r, SUM(store_amount) AS spent FROM customers GROUP BY phone ORDER BY spent DESC LIMIT 10`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
-  let text = `Top Customers\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach((c, i) => { text += `${i+1}. ${cleanText(c.name)} | 0${c.phone}\n${c.r}x renewals | ৳${(c.spent||0).toFixed(0)}\n\n`; });
+  let text = `Top Customers by Spend\n━━━━━━━━━━━━━━━━━━\n`;
+  rows.forEach((c, i) => { text += `${i+1}. ${cleanText(c.name)} | 0${c.phone}\n💰 ৳${(c.spent||0).toFixed(0)} | 🔄 ${c.r}x\n\n`; });
   sendAutoDelete(msg.chat.id, text);
 });
 
+// /unpaid - today's unpaid orders
 bot.onText(/\/unpaid/, (msg) => {
   if (!isOwner(msg)) return;
   const todayStr = today();
@@ -787,18 +753,18 @@ bot.onText(/\/unpaid/, (msg) => {
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No unpaid orders today.');
   let text = `Unpaid Orders Today (${rows.length})\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach((o, i) => {
-    let products = [];
-    try { products = JSON.parse(o.products || '[]'); } catch(e) {}
-    text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n📦 ${products.map(p => p.name).join(', ') || 'Unknown'}\n💰 ৳${o.amount} | ⏰ ${timeAgo(o.created_at)}\n\n`;
+    text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
+    text += `📦 ${getProductNames(o.products)}\n`;
+    text += `💰 ৳${o.amount} | ⏰ ${timeAgo(o.created_at)}\n\n`;
   });
   sendAutoDelete(msg.chat.id, text);
 });
 
 bot.onText(/\/cancelled/, (msg) => {
   if (!isOwner(msg)) return;
-  const allTime = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1`).get();
-  const last30  = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND COALESCE(cancelled_at, created_at) >= datetime('now', '-30 days')`).get();
-  const last7   = db.prepare(`SELECT * FROM pending_orders WHERE cancelled = 1 ORDER BY COALESCE(cancelled_at, created_at) DESC LIMIT 20`).all();
+  const allTime  = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1`).get();
+  const last30   = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM pending_orders WHERE cancelled = 1 AND COALESCE(cancelled_at, created_at) >= datetime('now', '-30 days')`).get();
+  const last7    = db.prepare(`SELECT * FROM pending_orders WHERE cancelled = 1 ORDER BY COALESCE(cancelled_at, created_at) DESC LIMIT 20`).all();
   const peakHour = db.prepare(`SELECT strftime('%H', cancelled_at) AS hr, COUNT(*) AS cnt FROM pending_orders WHERE cancelled = 1 AND cancelled_at IS NOT NULL GROUP BY hr ORDER BY cnt DESC LIMIT 1`).get();
   const peakTime = peakHour ? `${parseInt(peakHour.hr)}:00 - ${parseInt(peakHour.hr)+1}:00` : 'N/A';
   const cancelledPhones = db.prepare(`SELECT DISTINCT phone FROM pending_orders WHERE cancelled = 1`).all().map(r => r.phone);
@@ -810,15 +776,15 @@ bot.onText(/\/cancelled/, (msg) => {
   text += `All Time: ${allTime.cnt} | ৳${allTime.total.toFixed(0)}\n`;
   text += `Last 30 days: ${last30.cnt} | ৳${last30.total.toFixed(0)}\n`;
   text += `Peak Cancel Time: ${peakTime}\n`;
-  text += `Re-order Rate: ${reorderRate}%\n`;
-  text += `━━━━━━━━━━━━━━━━━━\n`;
+  text += `Re-order Rate: ${reorderRate}%\n━━━━━━━━━━━━━━━━━━\n`;
+
   if (last7.length) {
     text += `Recent ${last7.length}:\n\n`;
     last7.forEach((o, i) => {
-      let products = [];
-      try { products = JSON.parse(o.products || '[]'); } catch(e) {}
-      const cancelTime = o.cancelled_at ? formatEPSTime(o.cancelled_at) : formatEPSTime(o.created_at);
-      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n📦 ${products.map(p => p.name).join(', ') || 'Unknown'} | ৳${o.amount}\n⏰ ${cancelTime}\n\n`;
+      const cancelTime = formatEPSTime(o.cancelled_at || o.created_at);
+      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
+      text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
+      text += `⏰ ${cancelTime}\n\n`;
     });
   }
   sendAutoDelete(msg.chat.id, text);
@@ -829,20 +795,21 @@ bot.onText(/\/search (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
   const query = match[1].trim();
   const phone = normalizePhone(query);
-  const rows  = db.prepare(`
-    SELECT *, SUM(store_amount) OVER (PARTITION BY phone) AS lifetime_value
-    FROM customers
-    WHERE phone LIKE ? OR LOWER(name) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?)
-    ORDER BY created_at DESC LIMIT 10
-  `).all(`%${phone}%`, `%${query}%`, `%${query}%`);
+  const rows  = db.prepare(`SELECT * FROM customers WHERE phone LIKE ? OR LOWER(name) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?) ORDER BY created_at DESC LIMIT 10`).all(`%${phone}%`, `%${query}%`, `%${query}%`);
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No customer found.');
+
+  // Get lifetime value per phone
   let text = `Search: "${query}"\n━━━━━━━━━━━━━━━━━━\n`;
-  rows.forEach(c => {
-    const d = c.expiry_date ? daysUntil(c.expiry_date) : null;
+  const phones = [...new Set(rows.map(r => r.phone))];
+  phones.forEach(ph => {
+    const customerRows = rows.filter(r => r.phone === ph);
+    const ltv = db.prepare(`SELECT COALESCE(SUM(store_amount),0) AS total FROM customers WHERE phone = ?`).get(ph);
+    const c   = customerRows[0];
+    const d   = c.expiry_date ? daysUntil(c.expiry_date) : null;
     const status = c.expiry_date ? (d > 0 ? `✅ Active (${d}d)` : '❌ Expired') : '🎁 One-time';
     text += `${c.is_vip ? '⭐' : '👤'} ${cleanText(c.name)} | 0${c.phone}\n`;
     text += `📦 ${c.product}\n`;
-    text += `${status} | 🔄 #${c.renewal_count} | 💰 ৳${c.lifetime_value?.toFixed(0) || 0} lifetime\n\n`;
+    text += `${status} | 🔄 ${c.renewal_count}x | 💰 ৳${ltv.total.toFixed(0)} lifetime\n\n`;
   });
   sendAutoDelete(msg.chat.id, text);
 });
@@ -850,8 +817,8 @@ bot.onText(/\/search (.+)/, (msg, match) => {
 // /history
 bot.onText(/\/history (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
-  const phone  = normalizePhone(match[1].trim());
-  const orders = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC`).all(phone);
+  const phone     = normalizePhone(match[1].trim());
+  const orders    = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC`).all(phone);
   const cancelled = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND cancelled = 1 ORDER BY COALESCE(cancelled_at, created_at) DESC`).all(phone);
   const unpaid    = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0`).all(phone);
 
@@ -864,9 +831,9 @@ bot.onText(/\/history (.+)/, (msg, match) => {
   if (orders.length) {
     text += `💰 Lifetime Value: ৳${totalSpent.toFixed(0)}\n`;
     text += `🔄 Total Orders: ${orders.length}\n`;
-    text += `📅 Customer Since: ${firstOrder ? formatDate(firstOrder.start_date) : 'N/A'}\n`;
-    text += `${orders[0]?.is_vip ? '⭐ VIP Customer\n' : ''}\n`;
-    text += `✅ Orders:\n`;
+    text += `📅 Since: ${firstOrder ? formatDate(firstOrder.start_date) : 'N/A'}\n`;
+    if (orders[0]?.is_vip) text += `⭐ VIP Customer\n`;
+    text += `\n✅ Orders:\n`;
     orders.slice(0, 5).forEach(o => {
       text += `${o.order_name} | ${cleanText(o.product)}\n৳${o.store_amount || 0} | ${formatDate(o.start_date)}\n`;
       if (o.expiry_date) text += `Expires: ${formatDate(o.expiry_date)}\n`;
@@ -895,10 +862,15 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
   db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE id = ?').run(pending.id);
   saveContact(pending.phone, pending.name);
 
-  let products = [];
-  try { products = JSON.parse(pending.products || '[]'); } catch(e) {}
   const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
-  let text = `🚫 *Order Cancelled*\n👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n🛒 ${pending.order_name}\n📦 ${products.map(p => p.name).join(', ') || 'Unknown'}\n💰 ৳${pending.amount}\n📱 Phone saved ✅`;
+  let text =
+    `🚫 *Order Cancelled*\n` +
+    `👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n` +
+    `🛒 ${pending.order_name}\n` +
+    `📦 ${getProductNames(pending.products)}\n` +
+    `💰 ৳${pending.amount}\n` +
+    `📱 Phone saved ✅`;
+
   if (cancelCount.cnt >= 2) {
     const lost = db.prepare(`SELECT COALESCE(SUM(amount),0) AS t FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
     text += `\n⚠️ Repeat Canceller (${cancelCount.cnt}x) | Lost: ৳${lost.t.toFixed(0)}`;
@@ -946,7 +918,7 @@ bot.on('message', (msg) => {
       return sendAutoDelete(cid, `${cleanText(c.name)} | ${c.product}\nExpiry: ${c.expiry_date || 'One-time'}\n\nNew date (YYYY-MM-DD):`);
     }
     if (s.step === 'date') {
-      db.prepare(`UPDATE customers SET expiry_date=?, reminder_3_sent=0, reminder_1_sent=0 WHERE id=?`).run(text, s.customer.id);
+      db.prepare(`UPDATE customers SET expiry_date=?, reminder_1_sent=0 WHERE id=?`).run(text, s.customer.id);
       delete editState[cid];
       return sendAutoDelete(cid, `Updated to ${formatDate(text)}`);
     }
@@ -960,7 +932,7 @@ bot.on('message', (msg) => {
 // 8 AM - SMS balance check
 cron.schedule('0 8 * * *', async () => {
   try {
-    const res = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
+    const res     = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
     const balance = parseFloat(res.data?.balance || res.data?.data?.balance || 0);
     if (balance < 100) {
       await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ${balance}\nTop up now to avoid missed reminders!`);
@@ -968,50 +940,24 @@ cron.schedule('0 8 * * *', async () => {
   } catch(e) { console.error('SMS balance:', e.message); }
 });
 
-// 9 AM - discount SMS to cancelled customers (7 days after, once only)
-cron.schedule('0 9 * * *', async () => {
-  try {
-    const eligible = db.prepare(`
-      SELECT DISTINCT p.phone, p.name FROM pending_orders p
-      WHERE p.cancelled = 1 AND p.discount_sent = 0
-      AND COALESCE(p.cancelled_at, p.created_at) <= datetime('now', '-7 days')
-      AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
-    `).all();
-
-    for (const c of eligible) {
-      try {
-        await sendSMS(c.phone, SMS_DISCOUNT);
-        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ? AND cancelled = 1`).run(c.phone);
-        await sendTempMsg(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
-      } catch(e) { console.error('Discount SMS:', e.message); }
-    }
-  } catch(e) { console.error('Discount cron:', e.message); }
-});
-
-// Every 6 hours - health check (only if issues)
-cron.schedule('0 */6 * * *', async () => {
-  try {
-    const unpaidOld = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-3 hours')`).get();
-    const dbSize    = (() => { try { return fs.statSync(DB_PATH).size / 1024 / 1024; } catch(e) { return 0; } })();
-    if (unpaidOld.cnt > 10 || dbSize > 400) {
-      await safeSend(`⚠️ *Bot Health Alert*\n📦 Old unpaid: ${unpaidOld.cnt}\n💾 DB: ${dbSize.toFixed(1)}MB`);
-    }
-  } catch(e) { console.error('Health check:', e.message); }
-});
-
-// 7 PM - renewal + lost + expiry preview + 2nd follow-up
+// 7 PM - renewal + lost alerts + expiry preview + 12h unpaid list
 cron.schedule('0 19 * * *', async () => {
   const todayStr = today();
   const in1day   = addDaysStr(todayStr, 1);
   const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
 
-  // Renewal SMS 1 day
+  // Renewal SMS 1 day before
   const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND reminder_1_sent = 0`).all(in1day);
   for (const c of in1) {
     try {
       await sendSMS(c.phone, SMS_MSG1(c.product));
       db.prepare('UPDATE customers SET reminder_1_sent=1 WHERE id=?').run(c.id);
-      await safeSend(`🚨 *Renewal SMS (1 day)*\n👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n📅 TOMORROW`);
+      await safeSend(
+        `🚨 *Renewal SMS Sent (1 day)*\n` +
+        `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
+        `📦 ${c.product}\n` +
+        `📅 Expires: TOMORROW`
+      );
     } catch(e) { console.error('SMS 1d:', e.message); }
   }
 
@@ -1032,37 +978,55 @@ cron.schedule('0 19 * * *', async () => {
     await safeSend(text);
   }
 
-  // 2nd follow-up SMS
-  const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND followup_sent >= 1 AND datetime(created_at, '+6 hours') >= datetime(?, '-2 days') ORDER BY created_at ASC`).all(todayStr);
-  if (unpaid.length) {
-    let text = `📋 *Unpaid Orders (${unpaid.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-    unpaid.forEach((o, i) => {
-      let products = [];
-      try { products = JSON.parse(o.products || '[]'); } catch(e) {}
-      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n📦 ${products.map(p => p.name).join(', ') || 'Unknown'} | ৳${o.amount}\n\n`;
+  // 12h unpaid list with conversion tracking
+  const unpaid12h = db.prepare(`
+    SELECT * FROM pending_orders
+    WHERE paid = 0 AND cancelled = 0
+    AND created_at <= datetime('now', '-12 hours')
+    ORDER BY created_at ASC
+  `).all();
+
+  if (unpaid12h.length) {
+    // Conversion: how many paid after 1st follow-up
+    const paidAfterSMS = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 1 AND followup_sent >= 1 AND date(created_at, '+6 hours') = ?`).get(todayStr);
+
+    let text =
+      `📋 *Unpaid Orders (12h+)*\n━━━━━━━━━━━━━━━━━━\n` +
+      `✅ Paid after SMS today: ${paidAfterSMS.cnt}\n` +
+      `❌ Still unpaid: ${unpaid12h.length}\n` +
+      `━━━━━━━━━━━━━━━━━━\n`;
+
+    unpaid12h.forEach((o, i) => {
+      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
+      text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
+      text += `⏰ ${timeAgo(o.created_at)}\n\n`;
     });
+    text += `Use /cancel to cancel each order.`;
     await safeSend(text);
-
-    for (const o of unpaid) {
-      try {
-        await sendSMS(o.phone, SMS_FOLLOWUP);
-        db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE id=?').run(o.id);
-      } catch(e) { console.error('2nd followup:', e.message); }
-    }
-
-    // After 2 hours send cancel list
-    setTimeout(async () => {
-      const stillUnpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND followup_sent >= 2`).all();
-      if (!stillUnpaid.length) return;
-      let cancelText = `❌ *Cancel These Orders:*\n━━━━━━━━━━━━━━━━━━\n`;
-      stillUnpaid.forEach((o, i) => { cancelText += `${i+1}. ${o.order_name} — ${cleanText(o.name)} | ৳${o.amount}\n`; });
-      cancelText += `\nCancel on Shopify or use /cancel command.`;
-      await safeSend(cancelText);
-    }, 2 * 60 * 60 * 1000);
   }
 
   // Clean pending orders older than 24h
   db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
+});
+
+// 9 PM - discount SMS (7 days after cancel, once only)
+cron.schedule('0 21 * * *', async () => {
+  try {
+    const eligible = db.prepare(`
+      SELECT DISTINCT p.phone, p.name FROM pending_orders p
+      WHERE p.cancelled = 1 AND p.discount_sent = 0
+      AND COALESCE(p.cancelled_at, p.created_at) <= datetime('now', '-7 days')
+      AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
+    `).all();
+
+    for (const c of eligible) {
+      try {
+        await sendSMS(c.phone, SMS_DISCOUNT);
+        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ? AND cancelled = 1`).run(c.phone);
+        await safeSend(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
+      } catch(e) { console.error('Discount SMS:', e.message); }
+    }
+  } catch(e) { console.error('Discount cron:', e.message); }
 });
 
 // 10:30 PM - daily summary
@@ -1074,36 +1038,33 @@ cron.schedule('30 22 * * *', async () => {
     const active   = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE expiry_date >= ?`).get(todayStr);
     await safeSend(
       `📊 *Daily Summary*\n━━━━━━━━━━━━━━━━━━\n` +
-      `✅ Orders: ${t.orders}\n💰 Revenue: ৳${t.revenue.toFixed(0)}\n` +
-      `👥 Active: ${active.cnt}\n⚠️ Expiring This Week: ${expiring.cnt}`
+      `✅ Orders: ${t.orders}\n` +
+      `💰 Revenue: ৳${t.revenue.toFixed(0)}\n` +
+      `👥 Active: ${active.cnt}\n` +
+      `⚠️ Expiring This Week: ${expiring.cnt}`
     );
   } catch(e) { console.error('Summary:', e.message); }
 });
 
-// 11:50 PM - payment reconciliation report
+// 11:50 PM - payment reconciliation
 cron.schedule('50 23 * * *', async () => {
   try {
     const todayStr     = today();
     const totalSuccess = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total, COALESCE(SUM(store_amount),0) AS net FROM payments WHERE date(created_at, '+6 hours') = ? AND status = 'Success'`).get(todayStr);
     const totalFailed  = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS total FROM payments WHERE date(created_at, '+6 hours') = ? AND status != 'Success'`).get(todayStr);
     const matched      = db.prepare(`SELECT COUNT(*) AS cnt, COALESCE(SUM(store_amount),0) AS total FROM customers WHERE start_date = ?`).get(todayStr);
-    const unmatched    = totalSuccess.cnt - matched.cnt;
-    const unmatchedAmt = totalSuccess.total - matched.total;
+    const reportDate   = new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'long', year: 'numeric' });
 
-    // Match methods breakdown
-    const matchPhone  = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date = ?`).get(todayStr);
-
-    const reportDate = new Date().toLocaleDateString('en-US', { day: '2-digit', month: 'long', year: 'numeric' });
     await safeSend(
-      `📊 *Daily Payment Report — ${reportDate}*\n` +
+      `📊 *Payment Report — ${reportDate}*\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `💰 Total Received: ৳${totalSuccess.total.toFixed(0)} (${totalSuccess.cnt})\n` +
       `✅ Matched: ${matched.cnt} | ৳${matched.total.toFixed(0)}\n` +
-      `⚠️ Unmatched: ${Math.max(0, unmatched)} | ৳${Math.max(0, unmatchedAmt).toFixed(0)}\n` +
+      `⚠️ Unmatched: ${Math.max(0, totalSuccess.cnt - matched.cnt)}\n` +
       `❌ Failed: ${totalFailed.cnt} | ৳${totalFailed.total.toFixed(0)}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
       `🏪 Net Revenue: ৳${matched.total.toFixed(0)}\n` +
-      `📊 Gateway Fees: ৳${(totalSuccess.total - matched.total).toFixed(0)}`
+      `📊 Gateway Fees: ৳${(totalSuccess.total - matched.total > 0 ? totalSuccess.total - matched.total : 0).toFixed(0)}`
     );
   } catch(e) { console.error('Payment report:', e.message); }
 });
@@ -1122,27 +1083,7 @@ cron.schedule('0 10 1 * *', async () => {
 //  START
 // =============================================================
 
-app.listen(config.PORT, async () => {
-  console.log(`FanFlix Bot v6.0 on port ${config.PORT}`);
-  refreshShopifyToken().catch(e => console.error('Token refresh:', e.message));
-
-  // Reschedule pending follow-ups on restart
-  try {
-    const pending = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND followup_sent = 0 AND created_at > datetime('now', '-2 hours') AND created_at < datetime('now', '-50 minutes')`).all();
-    for (const o of pending) {
-      const delay = Math.max(0, new Date(o.created_at).getTime() + config.FOLLOW_UP_DELAY_MS - Date.now());
-      setTimeout(async () => {
-        const fresh = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(o.shopify_order_id);
-        if (!fresh || fresh.paid === 1 || fresh.cancelled === 1) return;
-        try {
-          await sendSMS(o.phone, SMS_FOLLOWUP);
-          db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(o.shopify_order_id);
-          await sendTempMsg(`⏰ *Follow-up SMS Sent!*\n👤 ${cleanText(o.name)} | 📱 0${o.phone}\n🛒 ${o.order_name}\n💰 ৳${o.amount}`);
-        } catch(e) { console.error('Rescheduled followup:', e.message); }
-      }, delay);
-    }
-    if (pending.length > 0) console.log(`Rescheduled ${pending.length} follow-ups`);
-  } catch(e) { console.error('Reschedule:', e.message); }
-
-  safeSend('🚀 *FanFlix Bot v6.0 Started!*').catch(() => {});
+app.listen(config.PORT, () => {
+  console.log(`FanFlix Bot v6.1 on port ${config.PORT}`);
+  safeSend('🚀 *FanFlix Bot v6.1 Started!*').catch(() => {});
 });
