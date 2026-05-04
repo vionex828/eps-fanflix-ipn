@@ -97,14 +97,59 @@ const SMS_FOLLOWUP =
 const SMS_DISCOUNT =
   `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে একটি অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি। আমরা আপনাকে আবার স্বাগত জানাতে চাই!\n\n🎁 শুধুমাত্র আপনার জন্য বিশেষ ১০% ছাড়!\n\nঅর্ডার করার সময় এই কোডটি ব্যবহার করুন:\n✅ কোড: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\n🌐 fanflixbd.com\n\nযেকোনো সহায়তায়:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
 
-// SMS time restriction: only send between 11 AM - 12:10 AM
+// SMS time restriction: only send between 11 AM - 12:10 AM BD time
 function canSendSMS() {
-  const hour = new Date().getHours();
-  const min  = new Date().getMinutes();
-  // Allow: 11:00 AM (11) to 12:10 AM (0:10)
-  if (hour >= 11) return true;
+  const now  = new Date();
+  const hour = now.getHours();
+  const min  = now.getMinutes();
+  // Allow: 11:00 AM to 11:59 PM (hour 11-23)
+  if (hour >= 11 && hour <= 23) return true;
+  // Allow: 12:00 AM to 12:10 AM (hour 0, min 0-10)
   if (hour === 0 && min <= 10) return true;
+  // Block: 12:11 AM to 10:59 AM
   return false;
+}
+
+// Fake name detection
+function isFakeName(name = '') {
+  if (!name || name.trim().length < 3) return { fake: true, reason: 'Name too short' };
+  const n = name.toLowerCase().trim();
+  // Check for vowels
+  const vowels = (n.match(/[aeiouaoiuaeiouyaeiou]/g) || []).length;
+  if (vowels === 0 && n.length > 3) return { fake: true, reason: 'No vowels in name' };
+  // Check repeated chars (sksks, asdfg)
+  const words = n.split(' ');
+  for (const word of words) {
+    if (word.length >= 4) {
+      // Check alternating pattern like sksksk
+      let alternating = true;
+      for (let i = 2; i < word.length; i++) {
+        if (word[i] !== word[i % 2]) { alternating = false; break; }
+      }
+      if (alternating) return { fake: true, reason: 'Repeated keyboard pattern' };
+    }
+  }
+  // Check keyboard mash patterns
+  const keyboardPatterns = ['asdf', 'qwer', 'zxcv', 'hjkl', 'bnm', 'sks', 'ksk', 'dsd', 'fgf', 'jkj'];
+  if (keyboardPatterns.some(p => n.includes(p))) return { fake: true, reason: 'Keyboard mash pattern' };
+  // Check all same chars
+  if (new Set(n.replace(/\s/g,'')).size <= 2 && n.length > 4) return { fake: true, reason: 'Too few unique characters' };
+  return { fake: false };
+}
+
+function isFakeEmail(email = '') {
+  if (!email) return false;
+  const fakePatterns = ['test@', 'asd@', 'asdf@', 'abc@', 'fake@', 'temp@', 'dummy@', '@test.', '@asd.', '@fake.'];
+  return fakePatterns.some(p => email.toLowerCase().includes(p));
+}
+
+function checkSuspicious(name, phone, email, amount) {
+  const reasons = [];
+  const nameCheck = isFakeName(name);
+  if (nameCheck.fake) reasons.push(nameCheck.reason);
+  if (phone && !isBDPhone(phone)) reasons.push('Invalid BD phone');
+  if (isFakeEmail(email)) reasons.push('Suspicious email');
+  return { suspicious: reasons.length > 0, reasons };
 }
 
 // =============================================================
@@ -350,6 +395,22 @@ app.post('/shopify-order', async (req, res) => {
       .run(String(o.id), o.name, name, phone || '', email, JSON.stringify(products), amount);
 
     saveContact(phone, name);
+
+    // Check for suspicious order
+    const suspCheck = checkSuspicious(name, phone, email, amount);
+    if (suspCheck.suspicious) {
+      await safeSend(
+        `⚠️ *Suspicious Order!*\n` +
+        `👤 ${cleanText(name)}\n` +
+        `📱 0${phone}\n` +
+        `📧 ${email || 'N/A'}\n` +
+        `🛒 ${o.name}\n` +
+        `📦 ${products.map(p => p.name).join(', ')}\n` +
+        `💰 ৳${amount}\n` +
+        `Reason: ${suspCheck.reasons.join(', ')}`
+      );
+      return; // Skip follow-up SMS for suspicious orders
+    }
 
     // 1 hour follow-up SMS
     setTimeout(async () => {
@@ -892,15 +953,13 @@ bot.onText(/\/export/, async (msg) => {
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
   let csv = 'Name,Phone,Email,Product,Type,Amount,Start,Expiry,Renewals,VIP\n';
   rows.forEach(c => { csv += `"${c.name}","0${c.phone}","${c.email}","${c.product}","${c.product_type}",${c.store_amount||0},${c.start_date},${c.expiry_date||'N/A'},${c.renewal_count},${c.is_vip?'Yes':'No'}\n`; });
-  const sent = await bot.sendDocument(msg.chat.id, Buffer.from(csv,'utf8'), {}, { filename: `fanflix_${today()}.csv`, contentType: 'text/csv' });
-  setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
+  await bot.sendDocument(msg.chat.id, Buffer.from(csv,'utf8'), {}, { filename: `fanflix_${today()}.csv`, contentType: 'text/csv' });
 });
 
 bot.onText(/\/exportcontacts/, async (msg) => {
   if (!isOwner(msg)) return;
   if (!fs.existsSync(CONTACTS_FILE)) return sendAutoDelete(msg.chat.id, 'No contacts yet.');
-  const sent = await bot.sendDocument(msg.chat.id, CONTACTS_FILE, {}, { filename: `contacts_${today()}.txt`, contentType: 'text/plain' });
-  setTimeout(() => bot.deleteMessage(msg.chat.id, sent.message_id).catch(() => {}), 60000);
+  await bot.sendDocument(msg.chat.id, CONTACTS_FILE, {}, { filename: `contacts_${today()}.txt`, contentType: 'text/plain' });
 });
 
 bot.on('message', (msg) => {
@@ -978,33 +1037,6 @@ cron.schedule('0 19 * * *', async () => {
     await safeSend(text);
   }
 
-  // 12h unpaid list with conversion tracking
-  const unpaid12h = db.prepare(`
-    SELECT * FROM pending_orders
-    WHERE paid = 0 AND cancelled = 0
-    AND created_at <= datetime('now', '-12 hours')
-    ORDER BY created_at ASC
-  `).all();
-
-  if (unpaid12h.length) {
-    // Conversion: how many paid after 1st follow-up
-    const paidAfterSMS = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 1 AND followup_sent >= 1 AND date(created_at, '+6 hours') = ?`).get(todayStr);
-
-    let text =
-      `📋 *Unpaid Orders (12h+)*\n━━━━━━━━━━━━━━━━━━\n` +
-      `✅ Paid after SMS today: ${paidAfterSMS.cnt}\n` +
-      `❌ Still unpaid: ${unpaid12h.length}\n` +
-      `━━━━━━━━━━━━━━━━━━\n`;
-
-    unpaid12h.forEach((o, i) => {
-      text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
-      text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
-      text += `⏰ ${timeAgo(o.created_at)}\n\n`;
-    });
-    text += `Use /cancel to cancel each order.`;
-    await safeSend(text);
-  }
-
   // Clean pending orders older than 24h
   db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
 });
@@ -1014,15 +1046,17 @@ cron.schedule('0 21 * * *', async () => {
   try {
     const eligible = db.prepare(`
       SELECT DISTINCT p.phone, p.name FROM pending_orders p
-      WHERE p.cancelled = 1 AND p.discount_sent = 0
+      WHERE p.cancelled = 1
       AND COALESCE(p.cancelled_at, p.created_at) <= datetime('now', '-7 days')
       AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
+      AND p.phone NOT IN (SELECT DISTINCT phone FROM pending_orders WHERE discount_sent = 1)
     `).all();
 
     for (const c of eligible) {
       try {
         await sendSMS(c.phone, SMS_DISCOUNT);
-        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ? AND cancelled = 1`).run(c.phone);
+        // Mark ALL cancelled orders for this phone as discount sent
+        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ?`).run(c.phone);
         await safeSend(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
       } catch(e) { console.error('Discount SMS:', e.message); }
     }
@@ -1046,7 +1080,7 @@ cron.schedule('30 22 * * *', async () => {
   } catch(e) { console.error('Summary:', e.message); }
 });
 
-// 11:50 PM - payment reconciliation
+// 11:50 PM - payment reconciliation + unpaid orders list
 cron.schedule('50 23 * * *', async () => {
   try {
     const todayStr     = today();
@@ -1066,6 +1100,27 @@ cron.schedule('50 23 * * *', async () => {
       `🏪 Net Revenue: ৳${matched.total.toFixed(0)}\n` +
       `📊 Gateway Fees: ৳${(totalSuccess.total - matched.total > 0 ? totalSuccess.total - matched.total : 0).toFixed(0)}`
     );
+
+    // Unpaid orders list
+    const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 ORDER BY created_at ASC`).all();
+    if (unpaid.length) {
+      const totalUnpaid = unpaid.reduce((s, o) => s + o.amount, 0);
+      const paidAfterSMS = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 1 AND followup_sent >= 1 AND date(created_at, '+6 hours') = ?`).get(todayStr);
+
+      let text =
+        `📋 *Unpaid Orders — Cancel These*\n━━━━━━━━━━━━━━━━━━\n` +
+        `✅ Paid after SMS today: ${paidAfterSMS.cnt}\n` +
+        `❌ Still unpaid: ${unpaid.length} | ৳${totalUnpaid.toFixed(0)}\n` +
+        `━━━━━━━━━━━━━━━━━━\n`;
+
+      unpaid.forEach((o, i) => {
+        text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
+        text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
+        text += `⏰ ${timeAgo(o.created_at)}\n\n`;
+      });
+      text += `Use /cancel orderid to cancel.`;
+      await safeSend(text);
+    }
   } catch(e) { console.error('Payment report:', e.message); }
 });
 
