@@ -114,14 +114,23 @@ function canSendSMS() {
 function isFakeName(name = '') {
   if (!name || name.trim().length < 3) return { fake: true, reason: 'Name too short' };
   const n = name.toLowerCase().trim();
-  // Check for vowels
-  const vowels = (n.match(/[aeiouaoiuaeiouyaeiou]/g) || []).length;
-  if (vowels === 0 && n.length > 3) return { fake: true, reason: 'No vowels in name' };
-  // Check repeated chars (sksks, asdfg)
-  const words = n.split(' ');
+  const words = n.split(' ').filter(w => w.length > 0);
+
   for (const word of words) {
+    if (word.length < 2) continue;
+
+    // Check vowels in word
+    const vowels = (word.match(/[aeiou]/g) || []).length;
+    const consonants = word.length - vowels;
+
+    // Word has no vowels and is long enough to be suspicious
+    if (vowels === 0 && word.length >= 3) return { fake: true, reason: 'No vowels in name' };
+
+    // Too many consonants in a row (consonant ratio > 75%)
+    if (word.length >= 4 && consonants / word.length > 0.75) return { fake: true, reason: 'Too many consonants' };
+
+    // Check alternating pattern like sksksk, bkbkbk
     if (word.length >= 4) {
-      // Check alternating pattern like sksksk
       let alternating = true;
       for (let i = 2; i < word.length; i++) {
         if (word[i] !== word[i % 2]) { alternating = false; break; }
@@ -129,26 +138,61 @@ function isFakeName(name = '') {
       if (alternating) return { fake: true, reason: 'Repeated keyboard pattern' };
     }
   }
-  // Check keyboard mash patterns
-  const keyboardPatterns = ['asdf', 'qwer', 'zxcv', 'hjkl', 'bnm', 'sks', 'ksk', 'dsd', 'fgf', 'jkj'];
+
+  // Keyboard mash patterns
+  const keyboardPatterns = ['asdf', 'qwer', 'zxcv', 'hjkl', 'sks', 'ksk', 'jfk', 'bkue', 'jeidh', 'bkdk', 'jsbdj'];
   if (keyboardPatterns.some(p => n.includes(p))) return { fake: true, reason: 'Keyboard mash pattern' };
-  // Check all same chars
-  if (new Set(n.replace(/\s/g,'')).size <= 2 && n.length > 4) return { fake: true, reason: 'Too few unique characters' };
+
+  // Too few unique characters
+  const unique = new Set(n.replace(/ /g, ''));
+  if (unique.size <= 2 && n.length > 4) return { fake: true, reason: 'Too few unique characters' };
+
   return { fake: false };
 }
 
 function isFakeEmail(email = '') {
   if (!email) return false;
-  const fakePatterns = ['test@', 'asd@', 'asdf@', 'abc@', 'fake@', 'temp@', 'dummy@', '@test.', '@asd.', '@fake.'];
-  return fakePatterns.some(p => email.toLowerCase().includes(p));
+  const e = email.toLowerCase();
+
+  // Fake email prefixes
+  const fakePrefixes = ['test', 'asd', 'asdf', 'abc', 'fake', 'temp', 'dummy', 'hhh', 'ggg', 'xxx', 'zzz', 'qwer'];
+  const prefix = e.split('@')[0];
+  if (fakePrefixes.some(p => prefix === p || prefix.startsWith(p + p[0]))) return true;
+
+  // Typo domains
+  const domain = e.split('@')[1] || '';
+  const typoDomains = ['gnail.com', 'gmai.com', 'gmial.com', 'gamil.com', 'yahooo.com', 'yaho.com',
+    'hotmial.com', 'hotmail.co', 'outlok.com', 'outloook.com', 'test.com', 'asd.com',
+    'fake.com', 'temp.com', 'example.com', 'abc.com', 'xyz.com'];
+  if (typoDomains.some(d => domain === d)) return true;
+
+  // Repeated chars in email prefix (hhhhhvg, aaabbb)
+  if (/(.){3,}/.test(prefix)) return true;
+
+  return false;
 }
 
-function checkSuspicious(name, phone, email, amount) {
+function isFakeAddress(address = '') {
+  if (!address) return false;
+  const a = address.toLowerCase();
+  // Too few unique chars
+  const words = a.split(/[\s,]+/).filter(w => w.length > 2);
+  for (const word of words) {
+    const vowels = (word.match(/[aeiou]/g) || []).length;
+    if (vowels === 0 && word.length >= 4) return true;
+    if (/(.){3,}/.test(word)) return true;
+  }
+  return false;
+}
+
+function checkSuspicious(name, phone, email, amount, address = '') {
   const reasons = [];
   const nameCheck = isFakeName(name);
   if (nameCheck.fake) reasons.push(nameCheck.reason);
-  if (phone && !isBDPhone(phone)) reasons.push('Invalid BD phone');
+  if (!phone || phone.length < 8) reasons.push('No phone number');
+  else if (!isBDPhone(phone)) reasons.push('Invalid BD phone');
   if (isFakeEmail(email)) reasons.push('Suspicious email');
+  if (isFakeAddress(address)) reasons.push('Fake address');
   return { suspicious: reasons.length > 0, reasons };
 }
 
@@ -397,7 +441,8 @@ app.post('/shopify-order', async (req, res) => {
     saveContact(phone, name);
 
     // Check for suspicious order
-    const suspCheck = checkSuspicious(name, phone, email, amount);
+    const address = o.billing_address ? `${o.billing_address.address1 || ''} ${o.billing_address.city || ''}`.trim() : '';
+    const suspCheck = checkSuspicious(name, phone, email, amount, address);
     if (suspCheck.suspicious) {
       await safeSend(
         `⚠️ *Suspicious Order!*\n` +
@@ -447,7 +492,7 @@ app.post('/shopify-cancel', async (req, res) => {
     if (!pending) return;
 
     saveContact(pending.phone, pending.name);
-    db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE shopify_order_id = ?').run(oid);
+    db.prepare(`UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime('now') WHERE shopify_order_id = ?`).run(oid);
 
     const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
     let msg =
@@ -920,7 +965,7 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
   const pending   = db.prepare(`SELECT * FROM pending_orders WHERE UPPER(REPLACE(order_name, '#', '')) = ? AND cancelled = 0`).get(orderName);
   if (!pending) return sendAutoDelete(msg.chat.id, `Order not found or already cancelled.`);
 
-  db.prepare('UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime("now") WHERE id = ?').run(pending.id);
+  db.prepare(`UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime('now') WHERE id = ?`).run(pending.id);
   saveContact(pending.phone, pending.name);
 
   const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
