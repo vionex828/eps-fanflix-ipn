@@ -226,6 +226,21 @@ function isOwner(msg) {
 //  UTILS
 // =============================================================
 
+function validateDomain(url) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname;
+  } catch (e) {
+    throw new Error(`Invalid URL: ${url}`);
+  }
+  // Strip leading 'www.' so both bare and www-prefixed hosts match
+  const bare = hostname.replace(/^www\./, '');
+  const allowed = config.WHITELISTED_DOMAINS.some(d => bare === d || bare.endsWith('.' + d));
+  if (!allowed) {
+    throw new Error(`Domain not whitelisted: ${hostname}`);
+  }
+}
+
 function decryptEPS(data) {
   const [ivBase64, cipherBase64] = data.split(':');
   const iv  = Buffer.from(ivBase64, 'base64');
@@ -366,8 +381,10 @@ async function sendSMS(phone, message) {
     console.log(`SMS blocked (outside hours) to ${phone}`);
     return;
   }
+  const smsUrl = 'https://bulksmsbd.net/api/smsapi';
+  validateDomain(smsUrl);
   const number = '880' + normalizePhone(phone);
-  await axios.post('https://bulksmsbd.net/api/smsapi', null, {
+  await axios.post(smsUrl, null, {
     params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
   });
 }
