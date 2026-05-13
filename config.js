@@ -20,6 +20,13 @@ module.exports = {
   SMS_API_KEY:   process.env.SMS_API_KEY   || 'YOUR_BULKSMSBD_API_KEY',
   SMS_SENDER_ID: process.env.SMS_SENDER_ID || 'FanFlix',
 
+  // WHITELISTED DOMAINS
+  // Only these domains are permitted for outbound API requests.
+  WHITELISTED_DOMAINS: [
+    'bulksmsbd.net',  // BulkSMSBD — SMS delivery API
+    'eps.com.bd',     // EPS — payment gateway
+  ],
+
   // EPS Payment Link
   EPS_PAYMENT_LINK: 'https://pg.eps.com.bd/DefaultPaymentLink?id=805A9AEE',
 
