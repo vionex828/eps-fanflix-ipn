@@ -1,7 +1,7 @@
 process.env.TZ = 'Asia/Dhaka';
 
 // =============================================
-//   FANFLIX BOT v6.1 - FINAL CLEAN
+//   FANFLIX BOT v6.2 - FINAL CLEAN
 // =============================================
 
 const express     = require('express');
@@ -102,98 +102,9 @@ function canSendSMS() {
   const now  = new Date();
   const hour = now.getHours();
   const min  = now.getMinutes();
-  // Allow: 11:00 AM to 11:59 PM (hour 11-23)
   if (hour >= 11 && hour <= 23) return true;
-  // Allow: 12:00 AM to 12:10 AM (hour 0, min 0-10)
   if (hour === 0 && min <= 10) return true;
-  // Block: 12:11 AM to 10:59 AM
   return false;
-}
-
-// Fake name detection
-function isFakeName(name = '') {
-  if (!name || name.trim().length < 3) return { fake: true, reason: 'Name too short' };
-  const n = name.toLowerCase().trim();
-  const words = n.split(' ').filter(w => w.length > 0);
-
-  for (const word of words) {
-    if (word.length < 2) continue;
-
-    // Check vowels in word
-    const vowels = (word.match(/[aeiou]/g) || []).length;
-    const consonants = word.length - vowels;
-
-    // Word has no vowels and is long enough to be suspicious
-    if (vowels === 0 && word.length >= 3) return { fake: true, reason: 'No vowels in name' };
-
-    // Too many consonants in a row (consonant ratio > 75%)
-    if (word.length >= 4 && consonants / word.length > 0.75) return { fake: true, reason: 'Too many consonants' };
-
-    // Check alternating pattern like sksksk, bkbkbk
-    if (word.length >= 4) {
-      let alternating = true;
-      for (let i = 2; i < word.length; i++) {
-        if (word[i] !== word[i % 2]) { alternating = false; break; }
-      }
-      if (alternating) return { fake: true, reason: 'Repeated keyboard pattern' };
-    }
-  }
-
-  // Keyboard mash patterns
-  const keyboardPatterns = ['asdf', 'qwer', 'zxcv', 'hjkl', 'sks', 'ksk', 'jfk', 'bkue', 'jeidh', 'bkdk', 'jsbdj'];
-  if (keyboardPatterns.some(p => n.includes(p))) return { fake: true, reason: 'Keyboard mash pattern' };
-
-  // Too few unique characters
-  const unique = new Set(n.replace(/ /g, ''));
-  if (unique.size <= 2 && n.length > 4) return { fake: true, reason: 'Too few unique characters' };
-
-  return { fake: false };
-}
-
-function isFakeEmail(email = '') {
-  if (!email) return false;
-  const e = email.toLowerCase();
-
-  // Fake email prefixes
-  const fakePrefixes = ['test', 'asd', 'asdf', 'abc', 'fake', 'temp', 'dummy', 'hhh', 'ggg', 'xxx', 'zzz', 'qwer'];
-  const prefix = e.split('@')[0];
-  if (fakePrefixes.some(p => prefix === p || prefix.startsWith(p + p[0]))) return true;
-
-  // Typo domains
-  const domain = e.split('@')[1] || '';
-  const typoDomains = ['gnail.com', 'gmai.com', 'gmial.com', 'gamil.com', 'yahooo.com', 'yaho.com',
-    'hotmial.com', 'hotmail.co', 'outlok.com', 'outloook.com', 'test.com', 'asd.com',
-    'fake.com', 'temp.com', 'example.com', 'abc.com', 'xyz.com'];
-  if (typoDomains.some(d => domain === d)) return true;
-
-  // Repeated chars in email prefix (hhhhhvg, aaabbb)
-  if (/(.){3,}/.test(prefix)) return true;
-
-  return false;
-}
-
-function isFakeAddress(address = '') {
-  if (!address) return false;
-  const a = address.toLowerCase();
-  // Too few unique chars
-  const words = a.split(/[\s,]+/).filter(w => w.length > 2);
-  for (const word of words) {
-    const vowels = (word.match(/[aeiou]/g) || []).length;
-    if (vowels === 0 && word.length >= 4) return true;
-    if (/(.){3,}/.test(word)) return true;
-  }
-  return false;
-}
-
-function checkSuspicious(name, phone, email, amount, address = '') {
-  const reasons = [];
-  const nameCheck = isFakeName(name);
-  if (nameCheck.fake) reasons.push(nameCheck.reason);
-  if (!phone || phone.length < 8) reasons.push('No phone number');
-  else if (!isBDPhone(phone)) reasons.push('Invalid BD phone');
-  if (isFakeEmail(email)) reasons.push('Suspicious email');
-  if (isFakeAddress(address)) reasons.push('Fake address');
-  return { suspicious: reasons.length > 0, reasons };
 }
 
 // =============================================================
@@ -233,7 +144,6 @@ function validateDomain(url) {
   } catch (e) {
     throw new Error(`Invalid URL: ${url}`);
   }
-  // Strip leading 'www.' so both bare and www-prefixed hosts match
   const bare = hostname.replace(/^www\./, '');
   const allowed = config.WHITELISTED_DOMAINS.some(d => bare === d || bare.endsWith('.' + d));
   if (!allowed) {
@@ -396,22 +306,18 @@ async function sendSMS(phone, message) {
 function findMatchingOrder(phone, email, name, amount) {
   const normalPhone = normalizePhone(phone);
 
-  // 1. Phone
   let order = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC LIMIT 1`).get(normalPhone);
   if (order) return { order, matchMethod: 'Phone' };
 
-  // 2. Email
   if (email) {
     order = db.prepare(`SELECT * FROM pending_orders WHERE LOWER(email) = LOWER(?) AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC LIMIT 1`).get(email);
     if (order) return { order, matchMethod: 'Email' };
   }
 
-  // 3. Name (fuzzy, last 6 hours)
   const recent = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-6 hours') ORDER BY created_at DESC`).all();
   const nameMatch = recent.find(o => nameSimilar(o.name, name));
   if (nameMatch) return { order: nameMatch, matchMethod: 'Name' };
 
-  // 4. Amount (last 2 hours)
   order = db.prepare(`SELECT * FROM pending_orders WHERE amount = ? AND paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-2 hours') ORDER BY created_at DESC LIMIT 1`).get(amount);
   if (order) return { order, matchMethod: 'Amount' };
 
@@ -456,23 +362,6 @@ app.post('/shopify-order', async (req, res) => {
       .run(String(o.id), o.name, name, phone || '', email, JSON.stringify(products), amount);
 
     saveContact(phone, name);
-
-    // Check for suspicious order
-    const address = o.billing_address ? `${o.billing_address.address1 || ''} ${o.billing_address.city || ''}`.trim() : '';
-    const suspCheck = checkSuspicious(name, phone, email, amount, address);
-    if (suspCheck.suspicious) {
-      await safeSend(
-        `⚠️ *Suspicious Order!*\n` +
-        `👤 ${cleanText(name)}\n` +
-        `📱 0${phone}\n` +
-        `📧 ${email || 'N/A'}\n` +
-        `🛒 ${o.name}\n` +
-        `📦 ${products.map(p => p.name).join(', ')}\n` +
-        `💰 ৳${amount}\n` +
-        `Reason: ${suspCheck.reasons.join(', ')}`
-      );
-      return; // Skip follow-up SMS for suspicious orders
-    }
 
     // 1 hour follow-up SMS
     setTimeout(async () => {
@@ -541,7 +430,6 @@ app.post('/eps-ipn', async (req, res) => {
 
     saveContact(p.customerPhone || '', p.customerName || '');
 
-    // Failed payment
     if (p.status !== 'Success') {
       await safeSend(
         `❌ *Failed Payment — FanFlix*\n` +
@@ -577,7 +465,6 @@ app.post('/eps-ipn', async (req, res) => {
 
     db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, store_amount, status) VALUES (?, ?, ?, ?, ?)').run(epsTxnId, normalizePhone(phone), totalAmt, storeAmt, p.status);
 
-    // Smart matching
     const matchResult = findMatchingOrder(phone, email, name, totalAmt);
 
     if (!matchResult) {
@@ -626,7 +513,6 @@ app.post('/eps-ipn', async (req, res) => {
     const renewalCount = existing ? existing.renewal_count + 1 : 1;
     const isVip        = renewalCount >= config.VIP_RENEWAL_COUNT ? 1 : 0;
 
-    // Early renewal detection
     const earlyRenewal = products.map(li => {
       const ex = db.prepare(`SELECT * FROM customers WHERE phone = ? AND product = ? AND expiry_date >= ? ORDER BY expiry_date ASC LIMIT 1`).get(normalizePhone(phone), li.name, today());
       return ex ? daysUntil(ex.expiry_date) : null;
@@ -678,7 +564,7 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('FanFlix Bot v6.1'));
+app.get('/', (req, res) => res.send('FanFlix Bot v6.2'));
 
 // =============================================================
 //  PAGINATION
@@ -775,7 +661,7 @@ bot.on('callback_query', async (query) => {
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   sendAutoDelete(msg.chat.id,
-    `FanFlix Bot v6.1\n\n` +
+    `FanFlix Bot v6.2\n\n` +
     `Commands:\n` +
     `/customers - Active customers\n` +
     `/expiring - Expiring this week\n` +
@@ -858,7 +744,6 @@ bot.onText(/\/retention/, (msg) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /top - sorted by highest spend
 bot.onText(/\/top/, (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT name, phone, MAX(renewal_count) AS r, SUM(store_amount) AS spent FROM customers GROUP BY phone ORDER BY spent DESC LIMIT 10`).all();
@@ -868,7 +753,6 @@ bot.onText(/\/top/, (msg) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /unpaid - today's unpaid orders
 bot.onText(/\/unpaid/, (msg) => {
   if (!isOwner(msg)) return;
   const todayStr = today();
@@ -900,28 +784,23 @@ bot.onText(/\/cancelled/, (msg) => {
   text += `Last 30 days: ${last30.cnt} | ৳${last30.total.toFixed(0)}\n`;
   text += `Peak Cancel Time: ${peakTime}\n`;
   text += `Re-order Rate: ${reorderRate}%\n━━━━━━━━━━━━━━━━━━\n`;
-
   if (last7.length) {
     text += `Recent ${last7.length}:\n\n`;
     last7.forEach((o, i) => {
-      const cancelTime = formatEPSTime(o.cancelled_at || o.created_at);
       text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
       text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
-      text += `⏰ ${cancelTime}\n\n`;
+      text += `⏰ ${formatEPSTime(o.cancelled_at || o.created_at)}\n\n`;
     });
   }
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /search
 bot.onText(/\/search (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
   const query = match[1].trim();
   const phone = normalizePhone(query);
   const rows  = db.prepare(`SELECT * FROM customers WHERE phone LIKE ? OR LOWER(name) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?) ORDER BY created_at DESC LIMIT 10`).all(`%${phone}%`, `%${query}%`, `%${query}%`);
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No customer found.');
-
-  // Get lifetime value per phone
   let text = `Search: "${query}"\n━━━━━━━━━━━━━━━━━━\n`;
   const phones = [...new Set(rows.map(r => r.phone))];
   phones.forEach(ph => {
@@ -937,19 +816,15 @@ bot.onText(/\/search (.+)/, (msg, match) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /history
 bot.onText(/\/history (.+)/, (msg, match) => {
   if (!isOwner(msg)) return;
   const phone     = normalizePhone(match[1].trim());
   const orders    = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC`).all(phone);
   const cancelled = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND cancelled = 1 ORDER BY COALESCE(cancelled_at, created_at) DESC`).all(phone);
   const unpaid    = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0`).all(phone);
-
   if (!orders.length && !cancelled.length) return sendAutoDelete(msg.chat.id, 'No history found.');
-
   const totalSpent = orders.reduce((s, o) => s + (o.store_amount || 0), 0);
   const firstOrder = orders.length ? orders[orders.length - 1] : null;
-
   let text = `Customer History | 0${phone}\n━━━━━━━━━━━━━━━━━━\n`;
   if (orders.length) {
     text += `💰 Lifetime Value: ৳${totalSpent.toFixed(0)}\n`;
@@ -975,16 +850,13 @@ bot.onText(/\/history (.+)/, (msg, match) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /cancel
 bot.onText(/\/cancel (.+)/, async (msg, match) => {
   if (!isOwner(msg)) return;
   const orderName = match[1].trim().toUpperCase().replace('#', '');
   const pending   = db.prepare(`SELECT * FROM pending_orders WHERE UPPER(REPLACE(order_name, '#', '')) = ? AND cancelled = 0`).get(orderName);
   if (!pending) return sendAutoDelete(msg.chat.id, `Order not found or already cancelled.`);
-
   db.prepare(`UPDATE pending_orders SET cancelled = 1, cancelled_at = datetime('now') WHERE id = ?`).run(pending.id);
   saveContact(pending.phone, pending.name);
-
   const cancelCount = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
   let text =
     `🚫 *Order Cancelled*\n` +
@@ -993,7 +865,6 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
     `📦 ${getProductNames(pending.products)}\n` +
     `💰 ৳${pending.amount}\n` +
     `📱 Phone saved ✅`;
-
   if (cancelCount.cnt >= 2) {
     const lost = db.prepare(`SELECT COALESCE(SUM(amount),0) AS t FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
     text += `\n⚠️ Repeat Canceller (${cancelCount.cnt}x) | Lost: ৳${lost.t.toFixed(0)}`;
@@ -1001,7 +872,6 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
   sendAutoDelete(msg.chat.id, text);
 });
 
-// /edit
 const editState = {};
 bot.onText(/\/edit/, (msg) => {
   if (!isOwner(msg)) return;
@@ -1029,7 +899,6 @@ bot.on('message', (msg) => {
   const cid  = msg.chat.id;
   const text = msg.text || '';
   if (text.startsWith('/')) return;
-
   if (editState[cid]) {
     const s = editState[cid];
     if (s.step === 'phone') {
@@ -1050,7 +919,6 @@ bot.on('message', (msg) => {
 //  SCHEDULED TASKS
 // =============================================================
 
-// 8 AM - SMS balance check
 cron.schedule('0 8 * * *', async () => {
   try {
     const res     = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
@@ -1061,13 +929,11 @@ cron.schedule('0 8 * * *', async () => {
   } catch(e) { console.error('SMS balance:', e.message); }
 });
 
-// 7 PM - renewal + lost alerts + expiry preview + 12h unpaid list
 cron.schedule('0 19 * * *', async () => {
   const todayStr = today();
   const in1day   = addDaysStr(todayStr, 1);
   const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
 
-  // Renewal SMS 1 day before
   const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND reminder_1_sent = 0`).all(in1day);
   for (const c of in1) {
     try {
@@ -1082,7 +948,6 @@ cron.schedule('0 19 * * *', async () => {
     } catch(e) { console.error('SMS 1d:', e.message); }
   }
 
-  // Lost customer alerts
   const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND lost_alert_sent = 0`).all(lost3ago);
   for (const c of lost) {
     try {
@@ -1091,7 +956,6 @@ cron.schedule('0 19 * * *', async () => {
     } catch(e) { console.error('Lost:', e.message); }
   }
 
-  // Tomorrow expiry preview
   const tomorrow = db.prepare(`SELECT * FROM customers WHERE expiry_date = ?`).all(in1day);
   if (tomorrow.length) {
     let text = `📅 *Expiring Tomorrow (${tomorrow.length})*\n━━━━━━━━━━━━━━━━━━\n`;
@@ -1099,11 +963,9 @@ cron.schedule('0 19 * * *', async () => {
     await safeSend(text);
   }
 
-  // Clean pending orders older than 24h
   db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
 });
 
-// 9 PM - discount SMS (7 days after cancel, once only)
 cron.schedule('0 21 * * *', async () => {
   try {
     const eligible = db.prepare(`
@@ -1113,11 +975,9 @@ cron.schedule('0 21 * * *', async () => {
       AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
       AND p.phone NOT IN (SELECT DISTINCT phone FROM pending_orders WHERE discount_sent = 1)
     `).all();
-
     for (const c of eligible) {
       try {
         await sendSMS(c.phone, SMS_DISCOUNT);
-        // Mark ALL cancelled orders for this phone as discount sent
         db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ?`).run(c.phone);
         await safeSend(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
       } catch(e) { console.error('Discount SMS:', e.message); }
@@ -1125,7 +985,6 @@ cron.schedule('0 21 * * *', async () => {
   } catch(e) { console.error('Discount cron:', e.message); }
 });
 
-// 10:30 PM - daily summary
 cron.schedule('30 22 * * *', async () => {
   try {
     const todayStr = today();
@@ -1142,7 +1001,6 @@ cron.schedule('30 22 * * *', async () => {
   } catch(e) { console.error('Summary:', e.message); }
 });
 
-// 11:50 PM - payment reconciliation + unpaid orders list
 cron.schedule('50 23 * * *', async () => {
   try {
     const todayStr     = today();
@@ -1163,18 +1021,15 @@ cron.schedule('50 23 * * *', async () => {
       `📊 Gateway Fees: ৳${(totalSuccess.total - matched.total > 0 ? totalSuccess.total - matched.total : 0).toFixed(0)}`
     );
 
-    // Unpaid orders list
     const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 ORDER BY created_at ASC`).all();
     if (unpaid.length) {
       const totalUnpaid = unpaid.reduce((s, o) => s + o.amount, 0);
       const paidAfterSMS = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 1 AND followup_sent >= 1 AND date(created_at, '+6 hours') = ?`).get(todayStr);
-
       let text =
         `📋 *Unpaid Orders — Cancel These*\n━━━━━━━━━━━━━━━━━━\n` +
         `✅ Paid after SMS today: ${paidAfterSMS.cnt}\n` +
         `❌ Still unpaid: ${unpaid.length} | ৳${totalUnpaid.toFixed(0)}\n` +
         `━━━━━━━━━━━━━━━━━━\n`;
-
       unpaid.forEach((o, i) => {
         text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
         text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
@@ -1186,7 +1041,6 @@ cron.schedule('50 23 * * *', async () => {
   } catch(e) { console.error('Payment report:', e.message); }
 });
 
-// 1st of month - growth
 cron.schedule('0 10 1 * *', async () => {
   try {
     const tm = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','start of month')`).get();
@@ -1201,6 +1055,6 @@ cron.schedule('0 10 1 * *', async () => {
 // =============================================================
 
 app.listen(config.PORT, () => {
-  console.log(`FanFlix Bot v6.1 on port ${config.PORT}`);
-  safeSend('🚀 *FanFlix Bot v6.1 Started!*').catch(() => {});
+  console.log(`FanFlix Bot v6.2 on port ${config.PORT}`);
+  safeSend('🚀 *FanFlix Bot v6.2 Started!*').catch(() => {});
 });
