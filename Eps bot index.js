@@ -564,6 +564,125 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
+
+// ── RENEWAL ENDPOINT (called by FanFlix) ──────────────────────────────
+const FANFLIX_URL = process.env.FANFLIX_URL || 'https://household.fanflixbd.com';
+const FANFLIX_ADMIN_TOKEN = process.env.FANFLIX_ADMIN_TOKEN || '@Orsha420@';
+const EPS_API = 'https://pgapi.eps.com.bd';
+
+function epsHash(data) {
+  const key = Buffer.from(config.EPS_SECRET_KEY, 'utf8');
+  return require('crypto').createHmac('sha512', key).update(data).digest('base64');
+}
+
+async function epsGetToken() {
+  const userName = process.env.EPS_USERNAME || 'mehedishimanto995@gmail.com';
+  const password = process.env.EPS_PASSWORD || 'FaN@45FLIX';
+  const xhash = epsHash(userName);
+  const res = await axios.post(EPS_API + '/v1/Auth/GetToken',
+    { userName, password },
+    { headers: { 'Content-Type':'application/json', 'x-hash': xhash } }
+  );
+  if (!res.data.token) throw new Error('EPS auth failed: ' + JSON.stringify(res.data));
+  return res.data.token;
+}
+
+app.post('/init-renewal', async (req, res) => {
+  try {
+    const { token, planId, planName, amount, days } = req.body;
+    if (!token || !amount) return res.status(400).json({ success:false, error:'Missing fields' });
+
+    const merchantId = process.env.EPS_MERCHANT_ID || '25787e85-78f5-48a8-b8ce-708673492b65';
+    const storeId    = process.env.EPS_STORE_ID    || '05983f40-ff21-43e1-acda-a12ac7c271c1';
+    const txnId      = Date.now() + '_RENEW_' + token;
+    const orderId    = 'FF_RENEW_' + token + '_' + Date.now();
+    const successUrl = FANFLIX_URL + '/renew/success?txn=' + txnId + '&token=' + token + '&plan=' + planId + '&days=' + days;
+    const failUrl    = FANFLIX_URL + '/renew/fail?token=' + token;
+    const cancelUrl  = FANFLIX_URL + '/c/' + token;
+
+    const bearerToken = await epsGetToken();
+    const xhash = epsHash(txnId);
+
+    const body = {
+      merchantId, storeId,
+      CustomerOrderId: orderId,
+      merchantTransactionId: txnId,
+      transactionTypeId: 1,
+      financialEntityId: 0,
+      transitionStatusId: 0,
+      totalAmount: amount,
+      ipAddress: '127.0.0.1',
+      version: '1',
+      successUrl, failUrl, cancelUrl,
+      customerName: 'FanFlix Customer',
+      customerEmail: 'customer@fanflixbd.com',
+      CustomerAddress: 'Dhaka',
+      CustomerAddress2: '',
+      CustomerCity: 'Dhaka',
+      CustomerState: 'Dhaka',
+      CustomerPostcode: '1000',
+      CustomerCountry: 'BD',
+      CustomerPhone: '01700000000',
+      ShippingMethod: 'NO',
+      NoOfItem: '1',
+      ProductName: planName || 'Netflix Subscription',
+      ProductProfile: 'digital-goods',
+      ProductCategory: 'Subscription',
+      ValueA: token,
+      ValueB: String(days),
+    };
+
+    const epRes = await axios.post(EPS_API + '/v1/EPSEngine/InitializeEPS', body, {
+      headers: { 'Content-Type':'application/json', 'x-hash': xhash, 'Authorization': 'Bearer ' + bearerToken }
+    });
+
+    if (!epRes.data.RedirectURL) throw new Error('No RedirectURL: ' + JSON.stringify(epRes.data));
+
+    // Store pending renewal
+    db.prepare('INSERT OR REPLACE INTO pending_orders (shopify_order_id, order_name, name, phone, email, products, amount) VALUES (?,?,?,?,?,?,?)')
+      .run(txnId, orderId, 'Renewal', '00000000000', token, JSON.stringify([{name:planName}]), amount);
+
+    res.json({ success:true, redirectUrl: epRes.data.RedirectURL, txnId });
+
+  } catch(e) {
+    console.error('init-renewal error:', e.message);
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
+// Verify renewal payment and extend FanFlix link
+app.get('/verify-renewal', async (req, res) => {
+  const { txn, token, days } = req.query;
+  try {
+    const bearerToken = await epsGetToken();
+    const xhash = epsHash(txn);
+    const vRes = await axios.get(EPS_API + '/v1/EPSEngine/CheckMerchantTransactionStatus?merchantTransactionId=' + txn, {
+      headers: { 'x-hash': xhash, 'Authorization': 'Bearer ' + bearerToken }
+    });
+    const v = vRes.data;
+    if (v.Status !== 'Success') {
+      return res.redirect(FANFLIX_URL + '/renew/fail?token=' + token + '&reason=payment_failed');
+    }
+    // Call FanFlix to extend link
+    const extRes = await axios.post(FANFLIX_URL + '/api/admin/extend/' + token,
+      { days: parseInt(days) },
+      { headers: { 'x-admin-token': FANFLIX_ADMIN_TOKEN } }
+    );
+    await safeSend(
+      '✅ *Renewal Successful!*\n' +
+      '🔗 /c/' + token + '\n' +
+      '📅 Extended by ' + days + ' days\n' +
+      '💰 ৳' + v.TotalAmount + '\n' +
+      '💳 ' + v.FinancialEntity
+    );
+    res.redirect(FANFLIX_URL + '/c/' + token + '?renewed=1&days=' + days);
+  } catch(e) {
+    console.error('verify-renewal error:', e.message);
+    res.redirect(FANFLIX_URL + '/renew/fail?token=' + token);
+  }
+});
+
+
 app.get('/', (req, res) => res.send('FanFlix Bot v6.2'));
 
 // =============================================================
