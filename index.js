@@ -113,6 +113,24 @@ function canSendSMS() {
 
 const bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: true });
 
+// ✅ FIX: Handle Telegram polling errors (409 conflict on restart, network errors)
+// Without this, a 409 from Telegram crashes the whole process on startup
+bot.on('polling_error', (err) => {
+  console.error('Polling error:', err.code, '-', err.message);
+  // 409 = previous instance still alive after restart — safe to ignore, resolves in ~5s
+  // EFATAL / ENOTFOUND = network issue — log and continue
+});
+
+// ✅ FIX: Catch any uncaught errors so the process never crashes silently
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err.message);
+  console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
 async function safeSend(text) {
   try {
     return await bot.sendMessage(config.TELEGRAM_CHAT_ID, text, { parse_mode: 'Markdown' });
@@ -566,9 +584,9 @@ app.post('/eps-ipn', async (req, res) => {
 
 
 // ── RENEWAL ENDPOINT (called by FanFlix customer page) ────────────────
-const FANFLIX_URL  = process.env.FANFLIX_URL  || 'https://household.fanflixbd.com';
+const FANFLIX_URL   = process.env.FANFLIX_URL   || 'https://household.fanflixbd.com';
 const FANFLIX_TOKEN = process.env.FANFLIX_TOKEN || '@Orsha420@';
-const EPS_PG_API   = 'https://pgapi.eps.com.bd';
+const EPS_PG_API    = 'https://pgapi.eps.com.bd';
 
 function epsHmac(data) {
   const key = Buffer.alloc(32);
@@ -587,9 +605,14 @@ async function epsToken() {
   return r.data.token;
 }
 
+// ✅ FIX: Accept real customer data from the customer page
 app.post('/init-renewal', async (req, res) => {
   try {
-    const { token, planId, planName, amount, days } = req.body;
+    const {
+      token, planId, planName, amount, days,
+      customerName, customerPhone, customerEmail   // ✅ now passed from customer page
+    } = req.body;
+
     if (!token || !amount) return res.status(400).json({ success:false, error:'Missing fields' });
 
     const merchantId = process.env.EPS_MERCHANT_ID || '25787e85-78f5-48a8-b8ce-708673492b65';
@@ -614,12 +637,12 @@ app.post('/init-renewal', async (req, res) => {
       ipAddress: '127.0.0.1',
       version: '1',
       successUrl, failUrl, cancelUrl,
-      customerName: 'FanFlix Customer',
-      customerEmail: 'customer@fanflixbd.com',
+      customerName:    customerName  || 'FanFlix Customer',      // ✅ real name
+      customerEmail:   customerEmail || 'customer@fanflixbd.com', // ✅ real email
       CustomerAddress: 'Dhaka', CustomerAddress2: '',
       CustomerCity: 'Dhaka', CustomerState: 'Dhaka',
       CustomerPostcode: '1000', CustomerCountry: 'BD',
-      CustomerPhone: '01700000000',
+      CustomerPhone:   customerPhone || '01700000000',            // ✅ real phone
       ShippingMethod: 'NO', NoOfItem: '1',
       ProductName: planName || 'Netflix Subscription',
       ProductProfile: 'digital-goods',
