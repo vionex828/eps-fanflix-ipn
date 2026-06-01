@@ -1,5 +1,5 @@
 // =============================================
-//   FANFLIX BOT v5.3 - CONFIG
+//   FANFLIX BOT v6.2 - CONFIG
 // =============================================
 
 module.exports = {
@@ -20,11 +20,15 @@ module.exports = {
   SMS_API_KEY:   process.env.SMS_API_KEY   || 'YOUR_BULKSMSBD_API_KEY',
   SMS_SENDER_ID: process.env.SMS_SENDER_ID || 'FanFlix',
 
+  // FANFLIX HOUSEHOLD — auto-create link after payment
+  FANFLIX_HOUSEHOLD_URL:  process.env.FANFLIX_HOUSEHOLD_URL  || 'https://household.fanflixbd.com',
+  FANFLIX_ADMIN_SECRET:   process.env.FANFLIX_ADMIN_SECRET   || '@Orsha420@',
+
   // WHITELISTED DOMAINS
-  // Only these domains are permitted for outbound API requests.
   WHITELISTED_DOMAINS: [
-    'bulksmsbd.net',  // BulkSMSBD — SMS delivery API
-    'eps.com.bd',     // EPS — payment gateway
+    'bulksmsbd.net',            // BulkSMSBD — SMS delivery API
+    'eps.com.bd',               // EPS — payment gateway
+    'household.fanflixbd.com',  // FanFlix household server
   ],
 
   // EPS Payment Link
