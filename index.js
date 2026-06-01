@@ -559,6 +559,71 @@ app.post('/eps-ipn', async (req, res) => {
 
     await safeSend(alert);
 
+    // ── AUTO-CREATE FANFLIX LINK ──────────────────────────────
+    // If payment is for a Netflix/combo subscription, auto-create the household link
+    const isNetflix = products.some(li => {
+      const n = (li.name || '').toLowerCase();
+      return n.includes('netflix') || n.includes('combo');
+    });
+
+    if (isNetflix && config.FANFLIX_HOUSEHOLD_URL && config.FANFLIX_ADMIN_SECRET) {
+      try {
+        // Detect days from product variant
+        const netflixProduct = products.find(li => {
+          const n = (li.name || '').toLowerCase();
+          return n.includes('netflix') || n.includes('combo');
+        });
+        const days = parseDuration(netflixProduct?.variant || netflixProduct?.name || '');
+
+        const res = await axios.post(
+          config.FANFLIX_HOUSEHOLD_URL + '/api/auto-create',
+          {
+            secret: config.FANFLIX_ADMIN_SECRET,
+            phone: phone,
+            customerName: name,
+            days: days,
+            orderName: pendingOrder.order_name,
+            amount: totalAmt,
+            product: netflixProduct?.name || 'Netflix'
+          },
+          { timeout: 10000 }
+        );
+
+        if (res.data?.success) {
+          const linkInfo = res.data;
+          await safeSend(
+            `🔗 *FanFlix Link Created!*\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `👤 ${cleanText(name)} | 📱 ${phone}\n` +
+            `👤 Profile: ${linkInfo.profile} | PIN: ${linkInfo.pin}\n` +
+            `🔗 ${linkInfo.link}\n` +
+            `⏳ ${days} days\n` +
+            `━━━━━━━━━━━━━━━━━━`
+          );
+          // Save token to customer record
+          db.prepare(`UPDATE customers SET fanflix_token = ? WHERE phone = ? AND start_date = ?`)
+            .run(linkInfo.token || '', normalizePhone(phone), today());
+        } else if (res.data?.waitlisted) {
+          await safeSend(
+            `🚨 *STOCK OUT — Customer Waitlisted!*\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `👤 ${cleanText(name)} | 📱 ${phone}\n` +
+            `📦 ${netflixProduct?.name || 'Netflix'} | ${days} days\n` +
+            `💰 ৳${totalAmt}\n` +
+            `🛒 ${pendingOrder.order_name}\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `⚠️ Add Netflix accounts then click Process Waitlist in admin panel!`
+          );
+        } else {
+          await safeSend(`⚠️ *Auto-Create Failed!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${res.data?.error || 'Unknown'}\nCreate link manually.`);
+        }
+      } catch(e) {
+        console.error('Auto-create error:', e.message);
+        await safeSend(`⚠️ *Auto-Create Error!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${e.message}\nCreate link manually.`);
+      }
+    }
+    // ─────────────────────────────────────────────────────────
+
   } catch(err) {
     console.error('IPN Error:', err.message);
     safeSend(`❌ Bot Error: ${err.message}`).catch(() => {});
