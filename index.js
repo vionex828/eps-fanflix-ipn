@@ -586,7 +586,10 @@ app.post('/eps-ipn', async (req, res) => {
             amount: totalAmt,
             product: netflixProduct?.name || 'Netflix'
           },
-          { timeout: 10000 }
+          {
+            timeout: 10000,
+            validateStatus: (status) => status < 600 // don't throw on 4xx/5xx
+          }
         );
 
         if (res.data?.success) {
