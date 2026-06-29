@@ -1,7 +1,7 @@
 process.env.TZ = 'Asia/Dhaka';
 
 // =============================================
-//   FANFLIX BOT v6.2 - FINAL CLEAN
+//   FANFLIX BOT v6.3 - BUG FIXES
 // =============================================
 
 const express     = require('express');
@@ -25,13 +25,10 @@ if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 
 const db = new Database(DB_PATH);
 
-// Migrations
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN products TEXT DEFAULT '[]'`); } catch(e) {}
-try { db.exec(`ALTER TABLE pending_orders ADD COLUMN discount_sent INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled_at TEXT`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
-try { db.exec(`ALTER TABLE customers ADD COLUMN fanflix_token TEXT DEFAULT ''`); } catch(e) {}
 try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
 try { db.exec(`UPDATE customers SET store_amount = amount * 0.977 WHERE store_amount = 0 AND amount > 0`); } catch(e) {}
 try { db.exec(`UPDATE pending_orders SET products = '[]' WHERE products IS NULL`); } catch(e) {}
@@ -80,25 +77,17 @@ db.exec(`
     paid             INTEGER DEFAULT 0,
     cancelled        INTEGER DEFAULT 0,
     cancelled_at     TEXT,
-    discount_sent    INTEGER DEFAULT 0,
     created_at       TEXT DEFAULT CURRENT_TIMESTAMP
   );
 `);
 
 // =============================================================
-//  SMS MESSAGES
+//  SMS
 // =============================================================
 
 const SMS_MSG1 = (product) =>
   `প্রিয় গ্রাহক,\n\nআপনার ${product} সাবস্ক্রিপশনটি আগামীকাল মেয়াদ শেষ হয়ে যাবে।\n\nসার্ভিস বন্ধ হওয়ার আগেই রিনিউ করুন এবং বিরতিহীন বিনোদন উপভোগ করতে থাকুন।\n\nরিনিউ করতে যোগাযোগ করুন:\n📲 WhatsApp: wa.me/+8801928382918\n\nঅথবা সরাসরি অর্ডার করুন:\n🌐 fanflixbd.com\n\n— FanFlix BD`;
 
-const SMS_FOLLOWUP =
-  `প্রিয় গ্রাহক,\n\nআপনি সম্প্রতি FanFlix-এ একটি অর্ডার করেছেন, কিন্তু পেমেন্টটি এখনো সম্পন্ন হয়নি। আপনার অর্ডারটি পেন্ডিং অবস্থায় রয়েছে।\n\nএখনই পেমেন্ট সম্পন্ন করুন:\n💳 https://pg.eps.com.bd/DefaultPaymentLink?id=805A9AEE\n\nযেকোনো সহায়তার জন্য WhatsApp করুন:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
-
-const SMS_DISCOUNT =
-  `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে একটি অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি। আমরা আপনাকে আবার স্বাগত জানাতে চাই!\n\n🎁 শুধুমাত্র আপনার জন্য বিশেষ ১০% ছাড়!\n\nঅর্ডার করার সময় এই কোডটি ব্যবহার করুন:\n✅ কোড: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\n🌐 fanflixbd.com\n\nযেকোনো সহায়তায়:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
-
-// SMS time restriction: only send between 11 AM - 12:10 AM BD time
 function canSendSMS() {
   const now  = new Date();
   const hour = now.getHours();
@@ -106,6 +95,14 @@ function canSendSMS() {
   if (hour >= 11 && hour <= 23) return true;
   if (hour === 0 && min <= 10) return true;
   return false;
+}
+
+async function sendSMS(phone, message) {
+  if (!canSendSMS()) { console.log(`SMS blocked (outside hours) to ${phone}`); return; }
+  const number = '880' + normalizePhone(phone);
+  await axios.post('https://bulksmsbd.net/api/smsapi', null, {
+    params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
+  });
 }
 
 // =============================================================
@@ -137,20 +134,6 @@ function isOwner(msg) {
 // =============================================================
 //  UTILS
 // =============================================================
-
-function validateDomain(url) {
-  let hostname;
-  try {
-    hostname = new URL(url).hostname;
-  } catch (e) {
-    throw new Error(`Invalid URL: ${url}`);
-  }
-  const bare = hostname.replace(/^www\./, '');
-  const allowed = config.WHITELISTED_DOMAINS.some(d => bare === d || bare.endsWith('.' + d));
-  if (!allowed) {
-    throw new Error(`Domain not whitelisted: ${hostname}`);
-  }
-}
 
 function decryptEPS(data) {
   const [ivBase64, cipherBase64] = data.split(':');
@@ -216,13 +199,13 @@ function isOneTime(type) { return type === 'giftcard' || type === 'software'; }
 
 function parseDuration(text = '') {
   const t = text.toLowerCase();
-  if (t.includes('1 year') || t.includes('12 month')) return 170;
-  if (t.includes('6 month')) return 170;
-  if (t.includes('3 month')) return 85;
-  if (t.includes('2 month')) return 85;
-  if (t.includes('1 month')) return 28;
-  if (t.includes('7 day') || t.includes('1 week')) return 28;
-  return 28;
+  if (t.includes('1 year') || t.includes('12 month')) return 365;
+  if (t.includes('6 month')) return 180;
+  if (t.includes('3 month')) return 90;
+  if (t.includes('2 month')) return 60;
+  if (t.includes('1 month')) return 30;
+  if (t.includes('7 day') || t.includes('1 week')) return 7;
+  return 30;
 }
 
 function addDays(n) {
@@ -266,16 +249,6 @@ function timeAgo(dateStr) {
   return `${Math.floor(mins/1440)}d ago`;
 }
 
-function nameSimilar(a = '', b = '') {
-  a = a.toLowerCase().trim();
-  b = b.toLowerCase().trim();
-  if (a === b) return true;
-  if (a.includes(b) || b.includes(a)) return true;
-  const wordsA = a.split(' ');
-  const wordsB = b.split(' ');
-  return wordsA.some(w => w.length > 2 && wordsB.includes(w));
-}
-
 function getProductNames(productsJson) {
   try {
     const products = JSON.parse(productsJson || '[]');
@@ -284,27 +257,10 @@ function getProductNames(productsJson) {
 }
 
 // =============================================================
-//  SMS SENDER
+//  SMART MATCHING (Phone + Email only)
 // =============================================================
 
-async function sendSMS(phone, message) {
-  if (!canSendSMS()) {
-    console.log(`SMS blocked (outside hours) to ${phone}`);
-    return;
-  }
-  const smsUrl = 'https://bulksmsbd.net/api/smsapi';
-  validateDomain(smsUrl);
-  const number = '880' + normalizePhone(phone);
-  await axios.post(smsUrl, null, {
-    params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
-  });
-}
-
-// =============================================================
-//  SMART MATCHING
-// =============================================================
-
-function findMatchingOrder(phone, email, name, amount) {
+function findMatchingOrder(phone, email) {
   const normalPhone = normalizePhone(phone);
 
   let order = db.prepare(`SELECT * FROM pending_orders WHERE phone = ? AND paid = 0 AND cancelled = 0 ORDER BY created_at DESC LIMIT 1`).get(normalPhone);
@@ -315,25 +271,7 @@ function findMatchingOrder(phone, email, name, amount) {
     if (order) return { order, matchMethod: 'Email' };
   }
 
-  const recent = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-6 hours') ORDER BY created_at DESC`).all();
-  const nameMatch = recent.find(o => nameSimilar(o.name, name));
-  if (nameMatch) return { order: nameMatch, matchMethod: 'Name' };
-
-  order = db.prepare(`SELECT * FROM pending_orders WHERE amount = ? AND paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-2 hours') ORDER BY created_at DESC LIMIT 1`).get(amount);
-  if (order) return { order, matchMethod: 'Amount' };
-
   return null;
-}
-
-function findPossibleMatches(phone, email, name, amount) {
-  const recent = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at >= datetime('now', '-24 hours') ORDER BY created_at DESC LIMIT 10`).all();
-  return recent.map(o => {
-    let score = 0;
-    if (nameSimilar(o.name, name)) score += 3;
-    if (email && o.email && o.email.toLowerCase() === email.toLowerCase()) score += 3;
-    if (Math.abs(o.amount - amount) < 1) score += 2;
-    return { ...o, score };
-  }).filter(o => o.score > 0).sort((a, b) => b.score - a.score).slice(0, 2);
 }
 
 // =============================================================
@@ -363,25 +301,6 @@ app.post('/shopify-order', async (req, res) => {
       .run(String(o.id), o.name, name, phone || '', email, JSON.stringify(products), amount);
 
     saveContact(phone, name);
-
-    // 1 hour follow-up SMS
-    setTimeout(async () => {
-      const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(o.id));
-      if (!pending || pending.paid === 1 || pending.cancelled === 1) return;
-      try {
-        await sendSMS(phone, SMS_FOLLOWUP);
-        db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(String(o.id));
-        await safeSend(
-          `⏰ *Follow-up SMS Sent!*\n` +
-          `👤 ${cleanText(name)} | 📱 0${phone}\n` +
-          `🛒 ${o.name}\n` +
-          `💰 ৳${amount}`
-        );
-      } catch(e) {
-        console.error('1hr followup:', e.message);
-        await safeSend(`❌ *Follow-up SMS Failed!*\n👤 ${cleanText(name)} | 📱 0${phone}\nError: ${e.message}`);
-      }
-    }, config.FOLLOW_UP_DELAY_MS);
 
   } catch(e) { console.error('Shopify order webhook:', e.message); }
 });
@@ -433,17 +352,14 @@ app.post('/eps-ipn', async (req, res) => {
 
     if (p.status !== 'Success') {
       await safeSend(
-        `❌ *Failed Payment — FanFlix*\n` +
+        `❌ *Failed Payment*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `👤 Name: ${cleanText(p.customerName)}\n` +
-        `📱 Phone: ${p.customerPhone || 'N/A'}\n` +
-        `📧 Email: ${p.customerEmail || 'N/A'}\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `💰 Amount: ৳${p.totalAmount}\n` +
-        `💳 Method: ${p.financialEntity || 'N/A'}\n` +
-        `📋 Status: ${p.status}\n` +
-        `🔖 Reference: ${p.merchantTransactionId || 'N/A'}\n` +
-        `🕐 Time: ${formatEPSTime(p.transactionDate)}\n` +
+        `👤 ${cleanText(p.customerName)}\n` +
+        `📱 ${p.customerPhone || 'N/A'}\n` +
+        `💰 ৳${p.totalAmount}\n` +
+        `💳 ${p.financialEntity || 'N/A'}\n` +
+        `📋 ${p.status}\n` +
+        `🕐 ${formatEPSTime(p.transactionDate)}\n` +
         `━━━━━━━━━━━━━━━━━━`
       );
       db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, store_amount, status) VALUES (?, ?, ?, 0, ?)').run(p.epsTransactionId || '', normalizePhone(p.customerPhone || ''), parseFloat(p.totalAmount || 0), p.status);
@@ -466,45 +382,28 @@ app.post('/eps-ipn', async (req, res) => {
 
     db.prepare('INSERT OR IGNORE INTO payments (eps_txn_id, phone, amount, store_amount, status) VALUES (?, ?, ?, ?, ?)').run(epsTxnId, normalizePhone(phone), totalAmt, storeAmt, p.status);
 
-    const matchResult = findMatchingOrder(phone, email, name, totalAmt);
+    const matchResult = findMatchingOrder(phone, email);
 
     if (!matchResult) {
-      const suggestions = findPossibleMatches(phone, email, name, totalAmt);
-      let msg =
-        `💰 *New Payment — FanFlix*\n` +
+      await safeSend(
+        `💰 *New Payment — No Order Found*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `👤 Name: ${cleanText(name)}\n` +
-        `📱 Phone: ${phone}\n` +
-        `📧 Email: ${email || 'N/A'}\n` +
+        `👤 ${cleanText(name)}\n` +
+        `📱 ${phone}\n` +
+        `📧 ${email || 'N/A'}\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `💰 Customer Paid: ৳${totalAmt}\n` +
-        `🏪 You Receive: ৳${storeAmt}\n` +
-        `📊 Gateway Fee: ৳${gatewayFee}\n` +
-        `💳 Method: ${method}\n` +
-        `🔖 Reference: ${reference}\n` +
-        `🕐 Time: ${time}\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `⚠️ No Shopify Order Found!`;
-      if (suggestions.length) {
-        msg += `\n\n💡 Possible matches:\n`;
-        suggestions.forEach(s => { msg += `${s.order_name} — ${cleanText(s.name)} | ৳${s.amount}\n`; });
-      }
-      await safeSend(msg);
+        `💰 ৳${totalAmt} | 🏪 ৳${storeAmt}\n` +
+        `📊 Fee: ৳${gatewayFee}\n` +
+        `💳 ${method}\n` +
+        `🔖 ${reference}\n` +
+        `🕐 ${time}\n` +
+        `━━━━━━━━━━━━━━━━━━`
+      );
       return;
     }
 
     const { order: pendingOrder, matchMethod } = matchResult;
     db.prepare('UPDATE pending_orders SET paid = 1 WHERE id = ?').run(pendingOrder.id);
-
-    if (pendingOrder.followup_sent >= 1) {
-      await safeSend(
-        `✅ *Paid After Follow-up!*\n` +
-        `👤 ${cleanText(name)} | 📱 ${phone}\n` +
-        `🛒 ${pendingOrder.order_name}\n` +
-        `💰 ৳${totalAmt}\n` +
-        `✅ Removed from unpaid list`
-      );
-    }
 
     let products = [];
     try { products = JSON.parse(pendingOrder.products || '[]'); } catch(e) {}
@@ -513,11 +412,6 @@ app.post('/eps-ipn', async (req, res) => {
     const existing     = db.prepare('SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1').get(normalizePhone(phone));
     const renewalCount = existing ? existing.renewal_count + 1 : 1;
     const isVip        = renewalCount >= config.VIP_RENEWAL_COUNT ? 1 : 0;
-
-    const earlyRenewal = products.map(li => {
-      const ex = db.prepare(`SELECT * FROM customers WHERE phone = ? AND product = ? AND expiry_date >= ? ORDER BY expiry_date ASC LIMIT 1`).get(normalizePhone(phone), li.name, today());
-      return ex ? daysUntil(ex.expiry_date) : null;
-    }).filter(d => d !== null && d <= 5);
 
     const productLines = [];
     for (const li of products) {
@@ -535,97 +429,26 @@ app.post('/eps-ipn', async (req, res) => {
       );
     }
 
-    let alert =
-      `✅ *New Payment — FanFlix*\n` +
+    await safeSend(
+      `✅ *New Payment*\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `👤 Name: ${cleanText(name)}\n` +
-      `📱 Phone: ${phone}\n` +
-      `📧 Email: ${email || 'N/A'}\n` +
+      `👤 ${cleanText(name)}\n` +
+      `📱 ${phone}\n` +
+      `📧 ${email || 'N/A'}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💰 Customer Paid: ৳${totalAmt}\n` +
-      `🏪 You Receive: ৳${storeAmt}\n` +
-      `📊 Gateway Fee: ৳${gatewayFee}\n` +
-      `💳 Method: ${method}\n` +
-      `🔖 Reference: ${reference}\n` +
-      `🕐 Time: ${time}\n` +
-      `🔗 Matched by: ${matchMethod}\n` +
+      `💰 ৳${totalAmt} | 🏪 ৳${storeAmt}\n` +
+      `📊 Fee: ৳${gatewayFee}\n` +
+      `💳 ${method}\n` +
+      `🔖 ${reference}\n` +
+      `🕐 ${time}\n` +
+      `🔗 ${matchMethod}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `🛒 Order: ${pendingOrder.order_name}\n` +
+      `🛒 ${pendingOrder.order_name}\n` +
       productLines.join('\n') + '\n' +
       (renewalCount > 1 ? `🔄 Renewal #${renewalCount}\n` : '') +
       (isVip ? `⭐ VIP Customer\n` : '') +
-      (earlyRenewal.length ? `⚠️ Early Renewal! ${earlyRenewal[0]}d still left\n` : '') +
-      `━━━━━━━━━━━━━━━━━━`;
-
-    await safeSend(alert);
-
-    // ── AUTO-CREATE FANFLIX LINK ──────────────────────────────
-    // If payment is for a Netflix/combo subscription, auto-create the household link
-    const isNetflix = products.some(li => {
-      const n = (li.name || '').toLowerCase();
-      return n.includes('netflix') || n.includes('combo');
-    });
-
-    if (isNetflix && config.FANFLIX_HOUSEHOLD_URL && config.FANFLIX_ADMIN_SECRET) {
-      try {
-        // Detect days from product variant
-        const netflixProduct = products.find(li => {
-          const n = (li.name || '').toLowerCase();
-          return n.includes('netflix') || n.includes('combo');
-        });
-        const days = parseDuration(netflixProduct?.variant || netflixProduct?.name || '');
-
-        const res = await axios.post(
-          config.FANFLIX_HOUSEHOLD_URL + '/api/auto-create',
-          {
-            secret: config.FANFLIX_ADMIN_SECRET,
-            phone: phone,
-            customerName: name,
-            days: days,
-            orderName: pendingOrder.order_name,
-            amount: totalAmt,
-            product: netflixProduct?.name || 'Netflix'
-          },
-          {
-            timeout: 10000,
-            validateStatus: (status) => status < 600 // don't throw on 4xx/5xx
-          }
-        );
-
-        if (res.data?.success) {
-          const linkInfo = res.data;
-          await safeSend(
-            `🔗 *FanFlix Link Created!*\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `👤 ${cleanText(name)} | 📱 ${phone}\n` +
-            `👤 Profile: ${linkInfo.profile} | PIN: ${linkInfo.pin}\n` +
-            `🔗 ${linkInfo.link}\n` +
-            `⏳ ${days} days\n` +
-            `━━━━━━━━━━━━━━━━━━`
-          );
-          // Save token to customer record
-          db.prepare(`UPDATE customers SET fanflix_token = ? WHERE phone = ? AND start_date = ?`)
-            .run(linkInfo.token || '', normalizePhone(phone), today());
-        } else if (res.data?.waitlisted) {
-          await safeSend(
-            `🚨 *STOCK OUT — Customer Waitlisted!*\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `👤 ${cleanText(name)} | 📱 ${phone}\n` +
-            `📦 ${netflixProduct?.name || 'Netflix'} | ${days} days\n` +
-            `💰 ৳${totalAmt}\n` +
-            `🛒 ${pendingOrder.order_name}\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `⚠️ Add Netflix accounts then click Process Waitlist in admin panel!`
-          );
-        } else {
-          await safeSend(`⚠️ *Auto-Create Failed!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${res.data?.error || 'Unknown'}\nCreate link manually.`);
-        }
-      } catch(e) {
-        console.error('Auto-create error:', e.message);
-        await safeSend(`⚠️ *Auto-Create Error!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${e.message}\nCreate link manually.`);
-      }
-    }
-    // ─────────────────────────────────────────────────────────
+      `━━━━━━━━━━━━━━━━━━`
+    );
 
   } catch(err) {
     console.error('IPN Error:', err.message);
@@ -633,7 +456,7 @@ app.post('/eps-ipn', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('FanFlix Bot v6.2'));
+app.get('/', (req, res) => res.send('FanFlix Bot v6.3'));
 
 // =============================================================
 //  PAGINATION
@@ -648,8 +471,7 @@ function showCustomerPage(chatId, page = 0) {
   const total      = allRows.length;
   const totalPages = Math.ceil(total / PAGE_SIZE);
   const rows       = allRows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-
-  const grouped = {};
+  const grouped    = {};
   rows.forEach(c => { if (!grouped[c.product]) grouped[c.product] = []; grouped[c.product].push(c); });
   const productCounts = {};
   allRows.forEach(c => { productCounts[c.product] = (productCounts[c.product] || 0) + 1; });
@@ -730,7 +552,7 @@ bot.on('callback_query', async (query) => {
 bot.onText(/\/start/, (msg) => {
   if (!isOwner(msg)) return;
   sendAutoDelete(msg.chat.id,
-    `FanFlix Bot v6.2\n\n` +
+    `FanFlix Bot v6.3\n\n` +
     `Commands:\n` +
     `/customers - Active customers\n` +
     `/expiring - Expiring this week\n` +
@@ -825,7 +647,7 @@ bot.onText(/\/top/, (msg) => {
 bot.onText(/\/unpaid/, (msg) => {
   if (!isOwner(msg)) return;
   const todayStr = today();
-  const rows = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND datetime(created_at, '+6 hours') >= ? AND datetime(created_at, '+6 hours') < ? ORDER BY created_at ASC`).all(todayStr + ' 00:00:00', todayStr + ' 23:59:59');
+  const rows = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND date(created_at) = ? ORDER BY created_at ASC`).all(todayStr);
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No unpaid orders today.');
   let text = `Unpaid Orders Today (${rows.length})\n━━━━━━━━━━━━━━━━━━\n`;
   rows.forEach((o, i) => {
@@ -896,10 +718,10 @@ bot.onText(/\/history (.+)/, (msg, match) => {
   const firstOrder = orders.length ? orders[orders.length - 1] : null;
   let text = `Customer History | 0${phone}\n━━━━━━━━━━━━━━━━━━\n`;
   if (orders.length) {
-    text += `💰 Lifetime Value: ৳${totalSpent.toFixed(0)}\n`;
-    text += `🔄 Total Orders: ${orders.length}\n`;
+    text += `💰 Lifetime: ৳${totalSpent.toFixed(0)}\n`;
+    text += `🔄 Orders: ${orders.length}\n`;
     text += `📅 Since: ${firstOrder ? formatDate(firstOrder.start_date) : 'N/A'}\n`;
-    if (orders[0]?.is_vip) text += `⭐ VIP Customer\n`;
+    if (orders[0]?.is_vip) text += `⭐ VIP\n`;
     text += `\n✅ Orders:\n`;
     orders.slice(0, 5).forEach(o => {
       text += `${o.order_name} | ${cleanText(o.product)}\n৳${o.store_amount || 0} | ${formatDate(o.start_date)}\n`;
@@ -932,8 +754,7 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
     `👤 ${cleanText(pending.name)} | 📱 0${pending.phone}\n` +
     `🛒 ${pending.order_name}\n` +
     `📦 ${getProductNames(pending.products)}\n` +
-    `💰 ৳${pending.amount}\n` +
-    `📱 Phone saved ✅`;
+    `💰 ৳${pending.amount}`;
   if (cancelCount.cnt >= 2) {
     const lost = db.prepare(`SELECT COALESCE(SUM(amount),0) AS t FROM pending_orders WHERE phone = ? AND cancelled = 1`).get(pending.phone);
     text += `\n⚠️ Repeat Canceller (${cancelCount.cnt}x) | Lost: ৳${lost.t.toFixed(0)}`;
@@ -942,13 +763,18 @@ bot.onText(/\/cancel (.+)/, async (msg, match) => {
 });
 
 const editState = {};
-bot.onText(/\/edit/, (msg) => {
+function setEditState(chatId, state) {
+  if (editState[chatId]?.timeout) clearTimeout(editState[chatId].timeout);
+  const timeout = setTimeout(() => { delete editState[chatId]; }, 5 * 60 * 1000);
+  editState[chatId] = { ...state, timeout };
+}
+bot.onText(/^\/edit$/, (msg) => {
   if (!isOwner(msg)) return;
-  editState[msg.chat.id] = { step: 'phone' };
+  setEditState(msg.chat.id, { step: 'phone' });
   sendAutoDelete(msg.chat.id, 'Enter phone number to edit:');
 });
 
-bot.onText(/\/export/, async (msg) => {
+bot.onText(/^\/export$/, async (msg) => {
   if (!isOwner(msg)) return;
   const rows = db.prepare(`SELECT * FROM customers ORDER BY created_at DESC`).all();
   if (!rows.length) return sendAutoDelete(msg.chat.id, 'No data.');
@@ -973,7 +799,8 @@ bot.on('message', (msg) => {
     if (s.step === 'phone') {
       const c = db.prepare(`SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1`).get(normalizePhone(text));
       if (!c) { delete editState[cid]; return sendAutoDelete(cid, 'Customer not found.'); }
-      s.customer = c; s.step = 'date';
+      s.customer = c;
+      setEditState(cid, { ...s, step: 'date' });
       return sendAutoDelete(cid, `${cleanText(c.name)} | ${c.product}\nExpiry: ${c.expiry_date || 'One-time'}\n\nNew date (YYYY-MM-DD):`);
     }
     if (s.step === 'date') {
@@ -985,73 +812,49 @@ bot.on('message', (msg) => {
 });
 
 // =============================================================
-//  SCHEDULED TASKS
+//  CRON JOBS
 // =============================================================
 
 cron.schedule('0 8 * * *', async () => {
   try {
     const res     = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
     const balance = parseFloat(res.data?.balance || res.data?.data?.balance || 0);
-    if (balance < 100) {
-      await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ${balance}\nTop up now to avoid missed reminders!`);
-    }
+    if (balance < 100) await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ${balance}`);
   } catch(e) { console.error('SMS balance:', e.message); }
-});
-
-cron.schedule('0 19 * * *', async () => {
-  const todayStr = today();
-  const in1day   = addDaysStr(todayStr, 1);
-  const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
-
-  const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND reminder_1_sent = 0`).all(in1day);
-  for (const c of in1) {
-    try {
-      await sendSMS(c.phone, SMS_MSG1(c.product));
-      db.prepare('UPDATE customers SET reminder_1_sent=1 WHERE id=?').run(c.id);
-      await safeSend(
-        `🚨 *Renewal SMS Sent (1 day)*\n` +
-        `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
-        `📦 ${c.product}\n` +
-        `📅 Expires: TOMORROW`
-      );
-    } catch(e) { console.error('SMS 1d:', e.message); }
-  }
-
-  const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND lost_alert_sent = 0`).all(lost3ago);
-  for (const c of lost) {
-    try {
-      await safeSend(`⚠️ *Lost Customer!*\n👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n💀 Expired ${config.LOST_ALERT_DAYS_AFTER_EXPIRY} days ago`);
-      db.prepare('UPDATE customers SET lost_alert_sent=1 WHERE id=?').run(c.id);
-    } catch(e) { console.error('Lost:', e.message); }
-  }
-
-  const tomorrow = db.prepare(`SELECT * FROM customers WHERE expiry_date = ?`).all(in1day);
-  if (tomorrow.length) {
-    let text = `📅 *Expiring Tomorrow (${tomorrow.length})*\n━━━━━━━━━━━━━━━━━━\n`;
-    tomorrow.forEach(c => { text += `👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n\n`; });
-    await safeSend(text);
-  }
-
-  db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
 });
 
 cron.schedule('0 21 * * *', async () => {
   try {
-    const eligible = db.prepare(`
-      SELECT DISTINCT p.phone, p.name FROM pending_orders p
-      WHERE p.cancelled = 1
-      AND COALESCE(p.cancelled_at, p.created_at) <= datetime('now', '-7 days')
-      AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
-      AND p.phone NOT IN (SELECT DISTINCT phone FROM pending_orders WHERE discount_sent = 1)
-    `).all();
-    for (const c of eligible) {
+    const todayStr = today();
+    const in1day   = addDaysStr(todayStr, 1);
+    const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
+
+    const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND reminder_1_sent = 0`).all(in1day);
+    for (const c of in1) {
       try {
-        await sendSMS(c.phone, SMS_DISCOUNT);
-        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ?`).run(c.phone);
-        await safeSend(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
-      } catch(e) { console.error('Discount SMS:', e.message); }
+        await sendSMS(c.phone, SMS_MSG1(c.product));
+        db.prepare('UPDATE customers SET reminder_1_sent=1 WHERE id=?').run(c.id);
+        await safeSend(`🚨 *Renewal SMS Sent*\n👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n📅 Expires: TOMORROW`);
+      } catch(e) { console.error('SMS 1d:', e.message); }
     }
-  } catch(e) { console.error('Discount cron:', e.message); }
+
+    const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND lost_alert_sent = 0`).all(lost3ago);
+    for (const c of lost) {
+      try {
+        await safeSend(`⚠️ *Lost Customer!*\n👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n💀 Expired ${config.LOST_ALERT_DAYS_AFTER_EXPIRY} days ago`);
+        db.prepare('UPDATE customers SET lost_alert_sent=1 WHERE id=?').run(c.id);
+      } catch(e) {}
+    }
+
+    const tomorrow = db.prepare(`SELECT * FROM customers WHERE expiry_date = ?`).all(in1day);
+    if (tomorrow.length) {
+      let text = `📅 *Expiring Tomorrow (${tomorrow.length})*\n━━━━━━━━━━━━━━━━━━\n`;
+      tomorrow.forEach(c => { text += `👤 ${cleanText(c.name)} | 0${c.phone}\n📦 ${c.product}\n\n`; });
+      await safeSend(text);
+    }
+
+    db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
+  } catch(e) { console.error('9pm cron error:', e.message); }
 });
 
 cron.schedule('30 22 * * *', async () => {
@@ -1067,7 +870,7 @@ cron.schedule('30 22 * * *', async () => {
       `👥 Active: ${active.cnt}\n` +
       `⚠️ Expiring This Week: ${expiring.cnt}`
     );
-  } catch(e) { console.error('Summary:', e.message); }
+  } catch(e) {}
 });
 
 cron.schedule('50 23 * * *', async () => {
@@ -1081,24 +884,17 @@ cron.schedule('50 23 * * *', async () => {
     await safeSend(
       `📊 *Payment Report — ${reportDate}*\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `💰 Total Received: ৳${totalSuccess.total.toFixed(0)} (${totalSuccess.cnt})\n` +
+      `💰 Received: ৳${totalSuccess.total.toFixed(0)} (${totalSuccess.cnt})\n` +
       `✅ Matched: ${matched.cnt} | ৳${matched.total.toFixed(0)}\n` +
       `⚠️ Unmatched: ${Math.max(0, totalSuccess.cnt - matched.cnt)}\n` +
-      `❌ Failed: ${totalFailed.cnt} | ৳${totalFailed.total.toFixed(0)}\n` +
+      `❌ Failed: ${totalFailed.cnt}\n` +
       `━━━━━━━━━━━━━━━━━━\n` +
-      `🏪 Net Revenue: ৳${matched.total.toFixed(0)}\n` +
-      `📊 Gateway Fees: ৳${(totalSuccess.total - matched.total > 0 ? totalSuccess.total - matched.total : 0).toFixed(0)}`
+      `🏪 Net Revenue: ৳${matched.total.toFixed(0)}`
     );
 
     const unpaid = db.prepare(`SELECT * FROM pending_orders WHERE paid = 0 AND cancelled = 0 ORDER BY created_at ASC`).all();
     if (unpaid.length) {
-      const totalUnpaid = unpaid.reduce((s, o) => s + o.amount, 0);
-      const paidAfterSMS = db.prepare(`SELECT COUNT(*) AS cnt FROM pending_orders WHERE paid = 1 AND followup_sent >= 1 AND date(created_at, '+6 hours') = ?`).get(todayStr);
-      let text =
-        `📋 *Unpaid Orders — Cancel These*\n━━━━━━━━━━━━━━━━━━\n` +
-        `✅ Paid after SMS today: ${paidAfterSMS.cnt}\n` +
-        `❌ Still unpaid: ${unpaid.length} | ৳${totalUnpaid.toFixed(0)}\n` +
-        `━━━━━━━━━━━━━━━━━━\n`;
+      let text = `📋 *Unpaid Orders*\n━━━━━━━━━━━━━━━━━━\n`;
       unpaid.forEach((o, i) => {
         text += `${i+1}. ${o.order_name} — ${cleanText(o.name)}\n`;
         text += `📦 ${getProductNames(o.products)} | ৳${o.amount}\n`;
@@ -1107,7 +903,7 @@ cron.schedule('50 23 * * *', async () => {
       text += `Use /cancel orderid to cancel.`;
       await safeSend(text);
     }
-  } catch(e) { console.error('Payment report:', e.message); }
+  } catch(e) {}
 });
 
 cron.schedule('0 10 1 * *', async () => {
@@ -1116,7 +912,7 @@ cron.schedule('0 10 1 * *', async () => {
     const lm = db.prepare(`SELECT COUNT(*) AS cnt FROM customers WHERE start_date >= date('now','start of month','-1 month') AND start_date < date('now','start of month')`).get();
     const g  = lm.cnt > 0 ? Math.round(((tm.cnt - lm.cnt) / lm.cnt) * 100) : 0;
     await safeSend(`${g >= 0 ? '📈' : '📉'} *Monthly Growth*\nLast: ${lm.cnt} | This: ${tm.cnt} | ${g >= 0 ? '+' : ''}${g}%`);
-  } catch(e) { console.error('Growth:', e.message); }
+  } catch(e) {}
 });
 
 // =============================================================
@@ -1124,6 +920,6 @@ cron.schedule('0 10 1 * *', async () => {
 // =============================================================
 
 app.listen(config.PORT, () => {
-  console.log(`FanFlix Bot v6.2 on port ${config.PORT}`);
-  safeSend('🚀 *FanFlix Bot v6.2 Started!*').catch(() => {});
+  console.log(`FanFlix Bot v6.3 on port ${config.PORT}`);
+  safeSend('🚀 *FanFlix Bot v6.3 Started!*').catch(() => {});
 });
