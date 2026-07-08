@@ -92,11 +92,8 @@ db.exec(`
 const SMS_MSG1 = (product) =>
   `প্রিয় গ্রাহক,\n\nআপনার ${product} সাবস্ক্রিপশনটি আগামীকাল মেয়াদ শেষ হয়ে যাবে।\n\nসার্ভিস বন্ধ হওয়ার আগেই রিনিউ করুন এবং বিরতিহীন বিনোদন উপভোগ করতে থাকুন।\n\nরিনিউ করতে যোগাযোগ করুন:\n📲 WhatsApp: wa.me/+8801928382918\n\nঅথবা সরাসরি অর্ডার করুন:\n🌐 fanflixbd.com\n\n— FanFlix BD`;
 
-const SMS_FOLLOWUP =
-  `প্রিয় গ্রাহক,\n\nআপনি সম্প্রতি FanFlix-এ একটি অর্ডার করেছেন, কিন্তু পেমেন্টটি এখনো সম্পন্ন হয়নি। আপনার অর্ডারটি পেন্ডিং অবস্থায় রয়েছে।\n\nএখনই পেমেন্ট সম্পন্ন করুন:\n💳 https://pg.eps.com.bd/DefaultPaymentLink?id=805A9AEE\n\nযেকোনো সহায়তার জন্য WhatsApp করুন:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
 
-const SMS_DISCOUNT =
-  `প্রিয় গ্রাহক,\n\nআপনি আগে FanFlix থেকে একটি অর্ডার করেছিলেন কিন্তু সম্পন্ন করেননি। আমরা আপনাকে আবার স্বাগত জানাতে চাই!\n\n🎁 শুধুমাত্র আপনার জন্য বিশেষ ১০% ছাড়!\n\nঅর্ডার করার সময় এই কোডটি ব্যবহার করুন:\n✅ কোড: WELCOMEBACK10\n\nএখনই অর্ডার করুন:\n🌐 fanflixbd.com\n\nযেকোনো সহায়তায়:\n📲 wa.me/+8801928382918\n\n— FanFlix BD`;
+
 
 // SMS time restriction: only send between 11 AM - 12:10 AM BD time
 function canSendSMS() {
@@ -298,6 +295,14 @@ async function sendSMS(phone, message) {
   await axios.post(smsUrl, null, {
     params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
   });
+  // Check balance after every SMS — alert if under 100tk
+  try {
+    const balRes  = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
+    const balance = parseFloat(balRes.data?.balance || balRes.data?.data?.balance || 0);
+    if (balance < 100) {
+      await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ৳${balance}\nTop up now to avoid missed reminders!`);
+    }
+  } catch(e) { console.error('Balance check:', e.message); }
 }
 
 // =============================================================
@@ -364,24 +369,6 @@ app.post('/shopify-order', async (req, res) => {
 
     saveContact(phone, name);
 
-    // 1 hour follow-up SMS
-    setTimeout(async () => {
-      const pending = db.prepare('SELECT * FROM pending_orders WHERE shopify_order_id = ?').get(String(o.id));
-      if (!pending || pending.paid === 1 || pending.cancelled === 1) return;
-      try {
-        await sendSMS(phone, SMS_FOLLOWUP);
-        db.prepare('UPDATE pending_orders SET followup_sent = followup_sent + 1 WHERE shopify_order_id = ?').run(String(o.id));
-        await safeSend(
-          `⏰ *Follow-up SMS Sent!*\n` +
-          `👤 ${cleanText(name)} | 📱 0${phone}\n` +
-          `🛒 ${o.name}\n` +
-          `💰 ৳${amount}`
-        );
-      } catch(e) {
-        console.error('1hr followup:', e.message);
-        await safeSend(`❌ *Follow-up SMS Failed!*\n👤 ${cleanText(name)} | 📱 0${phone}\nError: ${e.message}`);
-      }
-    }, config.FOLLOW_UP_DELAY_MS);
 
   } catch(e) { console.error('Shopify order webhook:', e.message); }
 });
@@ -988,17 +975,9 @@ bot.on('message', (msg) => {
 //  SCHEDULED TASKS
 // =============================================================
 
-cron.schedule('0 8 * * *', async () => {
-  try {
-    const res     = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
-    const balance = parseFloat(res.data?.balance || res.data?.data?.balance || 0);
-    if (balance < 100) {
-      await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ${balance}\nTop up now to avoid missed reminders!`);
-    }
-  } catch(e) { console.error('SMS balance:', e.message); }
-});
 
-cron.schedule('0 19 * * *', async () => {
+
+cron.schedule('30 21 * * *', async () => {
   const todayStr = today();
   const in1day   = addDaysStr(todayStr, 1);
   const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
@@ -1035,24 +1014,6 @@ cron.schedule('0 19 * * *', async () => {
   db.prepare(`DELETE FROM pending_orders WHERE paid = 0 AND cancelled = 0 AND created_at < datetime('now', '-24 hours')`).run();
 });
 
-cron.schedule('0 21 * * *', async () => {
-  try {
-    const eligible = db.prepare(`
-      SELECT DISTINCT p.phone, p.name FROM pending_orders p
-      WHERE p.cancelled = 1
-      AND COALESCE(p.cancelled_at, p.created_at) <= datetime('now', '-7 days')
-      AND p.phone NOT IN (SELECT DISTINCT phone FROM customers)
-      AND p.phone NOT IN (SELECT DISTINCT phone FROM pending_orders WHERE discount_sent = 1)
-    `).all();
-    for (const c of eligible) {
-      try {
-        await sendSMS(c.phone, SMS_DISCOUNT);
-        db.prepare(`UPDATE pending_orders SET discount_sent = 1 WHERE phone = ?`).run(c.phone);
-        await safeSend(`🎁 *Discount SMS Sent!*\n👤 ${cleanText(c.name)} | 📱 0${c.phone}\nCode: WELCOMEBACK10`);
-      } catch(e) { console.error('Discount SMS:', e.message); }
-    }
-  } catch(e) { console.error('Discount cron:', e.message); }
-});
 
 cron.schedule('30 22 * * *', async () => {
   try {
