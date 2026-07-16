@@ -215,11 +215,11 @@ function parseDuration(text = '') {
   const t = text.toLowerCase();
   if (t.includes('1 year') || t.includes('12 month')) return 170;
   if (t.includes('6 month')) return 170;
-  if (t.includes('3 month')) return 85;
-  if (t.includes('2 month')) return 85;
-  if (t.includes('1 month')) return 28;
-  if (t.includes('7 day') || t.includes('1 week')) return 28;
-  return 28;
+  if (t.includes('3 month')) return 90;
+  if (t.includes('2 month')) return 90;
+  if (t.includes('1 month')) return 30;
+  if (t.includes('7 day') || t.includes('1 week')) return 30;
+  return 30;
 }
 
 function addDays(n) {
