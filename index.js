@@ -982,7 +982,20 @@ cron.schedule('30 21 * * *', async () => {
   const in1day   = addDaysStr(todayStr, 1);
   const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
 
-  const in1 = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND reminder_1_sent = 0`).all(in1day);
+  // Exclude Netflix/Combo products - household system now owns their reminders.
+  // Also defensively join against payments/pending_orders to ensure only genuinely
+  // paid customers ever get a reminder, even if a stray unpaid row ever exists.
+  const in1 = db.prepare(`
+    SELECT * FROM customers
+    WHERE expiry_date = ?
+      AND reminder_1_sent = 0
+      AND LOWER(product) NOT LIKE '%netflix%'
+      AND LOWER(product) NOT LIKE '%combo%'
+      AND EXISTS (
+        SELECT 1 FROM pending_orders po
+        WHERE po.shopify_order_id = customers.order_id AND po.paid = 1
+      )
+  `).all(in1day);
   for (const c of in1) {
     try {
       await sendSMS(c.phone, SMS_MSG1(c.product));
