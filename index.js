@@ -31,6 +31,12 @@ try { db.exec(`ALTER TABLE pending_orders ADD COLUMN products TEXT DEFAULT '[]'`
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN discount_sent INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled_at TEXT`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN pending_notice_sent INTEGER DEFAULT 0`); } catch(e) {}
+// One-time backfill: mark all orders that existed BEFORE this feature was added
+// as already-notified, so the payment_pending_notice cron only ever applies to
+// genuinely new orders going forward - never the historical backlog.
+// Fixed cutoff date (safe to re-run on every restart - only affects orders
+// older than this fixed point in time, never newly-created ones).
+try { db.exec(`UPDATE pending_orders SET pending_notice_sent = 1 WHERE pending_notice_sent = 0 AND created_at < '2026-07-31 00:00:00'`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN fanflix_token TEXT DEFAULT ''`); } catch(e) {}
 try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
@@ -1089,12 +1095,15 @@ bot.on('message', (msg) => {
 
 // Payment pending notice - checks every 15 min for orders unpaid for 1+ hour,
 // sends the WhatsApp notice once per order (tracked via pending_notice_sent).
+// IMPORTANT: upper bound (48h) prevents ever matching old/historical orders -
+// only genuinely recent, still-relevant unpaid orders qualify.
 cron.schedule('*/15 * * * *', async () => {
   try {
     const rows = db.prepare(`
       SELECT * FROM pending_orders
       WHERE paid = 0 AND cancelled = 0 AND pending_notice_sent = 0
         AND datetime(created_at, '+1 hours') <= datetime('now')
+        AND datetime(created_at, '+48 hours') > datetime('now')
     `).all();
 
     for (const order of rows) {
