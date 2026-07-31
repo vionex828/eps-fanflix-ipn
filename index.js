@@ -30,6 +30,7 @@ try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled INTEGER DEFAULT 0
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN products TEXT DEFAULT '[]'`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN discount_sent INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE pending_orders ADD COLUMN cancelled_at TEXT`); } catch(e) {}
+try { db.exec(`ALTER TABLE pending_orders ADD COLUMN pending_notice_sent INTEGER DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
 try { db.exec(`ALTER TABLE customers ADD COLUMN fanflix_token TEXT DEFAULT ''`); } catch(e) {}
 try { db.exec(`ALTER TABLE payments ADD COLUMN store_amount REAL DEFAULT 0`); } catch(e) {}
@@ -306,6 +307,110 @@ async function sendSMS(phone, message) {
 }
 
 // =============================================================
+//  RESPOND.IO — WHATSAPP TEMPLATE MESSAGES
+// =============================================================
+
+// Generic WhatsApp template sender via Respond.io's Messages API.
+// Respond.io requires the contact to already exist before you can message them -
+// so we create (or update, if already exists) the contact first, then send.
+async function sendWhatsAppTemplate(phone, customerName, templateName, components) {
+  try {
+    const num = normalizePhone(phone);
+    if (!num || num.length < 7) return false;
+    const respondPhone = num.startsWith('880') ? num : '880' + num.replace(/^0+/, '');
+    const firstName = (customerName || 'FanFlix Customer').split(' ')[0] || 'FanFlix';
+    const lastName = (customerName || '').split(' ').slice(1).join(' ') || '';
+
+    const contactUrl = `https://api.respond.io/v2/contact/phone:${respondPhone}`;
+    validateDomain(contactUrl);
+
+    // Step 1: create (or update) the contact - required before messaging is possible
+    try {
+      await axios.post(contactUrl,
+        { phone: `+${respondPhone}`, firstName, lastName },
+        { headers: { 'Authorization': `Bearer ${config.RESPONDIO_API_KEY}` } }
+      );
+    } catch(e) {
+      const status = e.response?.status;
+      const errText = JSON.stringify(e.response?.data || {});
+      const alreadyExists = status === 403 && /already exist/i.test(errText);
+      if (!alreadyExists) {
+        console.error(`Respond.io contact create failed (${templateName}):`, status, errText.slice(0,300));
+      }
+    }
+
+    const payload = {
+      channelId: config.RESPONDIO_CHANNEL_ID,
+      message: {
+        type: 'whatsapp_template',
+        template: { name: templateName, languageCode: 'en', components },
+      },
+    };
+
+    const messageUrl = `https://api.respond.io/v2/contact/phone:${respondPhone}/message`;
+    validateDomain(messageUrl);
+
+    // Respond.io's own guidance: wait after creating a contact before the next
+    // action - the contact resource needs time to finish being created first.
+    await new Promise(r => setTimeout(r, 8000));
+
+    // Retry on 449 (Respond.io's own "queued, try again shortly" status)
+    const backoffs = [10000, 20000, 30000];
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        await axios.post(messageUrl, payload, { headers: { 'Authorization': `Bearer ${config.RESPONDIO_API_KEY}` } });
+        return true;
+      } catch(e) {
+        const status = e.response?.status;
+        const errText = JSON.stringify(e.response?.data || {});
+        if (status !== 449 || attempt > backoffs.length) {
+          console.error(`Respond.io send failed (${templateName}):`, status, errText.slice(0,300));
+          return false;
+        }
+        const wait = backoffs[attempt-1];
+        console.error(`Respond.io send queued (${templateName}, attempt ${attempt}/4), retrying in ${wait/1000}s...`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+    return false;
+  } catch(e) {
+    console.error(`sendWhatsAppTemplate error (${templateName}):`, e.message);
+    return false;
+  }
+}
+
+// order_confirmation - approved template, sent instantly when payment is confirmed (any product)
+async function sendOrderConfirmation(phone, customerName, product, amount, orderId) {
+  return sendWhatsAppTemplate(phone, customerName, 'order_confirmation', [
+    { type: 'header', format: 'text', text: 'Order Confirmation', parameters: [] },
+    {
+      type: 'body',
+      text: 'This is an automated confirmation from FanFlix BD regarding your recent order.\n\nProduct: {{1}}\nAmount paid: ৳{{2}}\nOrder id: {{3}}\n\nYour payment has been received and your order is now being processed. You will receive your account details shortly.',
+      parameters: [
+        { type: 'text', text: product },
+        { type: 'text', text: String(amount) },
+        { type: 'text', text: orderId },
+      ],
+    },
+  ]);
+}
+
+// payment_pending_notice - approved template, sent ~1h after unpaid order
+async function sendPaymentPendingNotice(phone, customerName, product, orderId) {
+  return sendWhatsAppTemplate(phone, customerName, 'payment_pending_notice', [
+    { type: 'header', format: 'text', text: 'Payment Pending', parameters: [] },
+    {
+      type: 'body',
+      text: 'This is an automated notice from FanFlix BD regarding your recent order.\n\nProduct: {{1}}\nOrder id: {{2}}\n\nOur records show that payment has not yet been completed for this order. If you have already made the payment, please reply to this message with your payment details so we can verify and process your order.',
+      parameters: [
+        { type: 'text', text: product },
+        { type: 'text', text: orderId },
+      ],
+    },
+  ]);
+}
+
+// =============================================================
 //  SMART MATCHING
 // =============================================================
 
@@ -496,6 +601,13 @@ app.post('/eps-ipn', async (req, res) => {
     let products = [];
     try { products = JSON.parse(pendingOrder.products || '[]'); } catch(e) {}
     if (!products.length) products = [{ name: 'Unknown Product', variant: '' }];
+
+    // Send order confirmation via WhatsApp for every matched payment, any product.
+    // Fire-and-forget so it never blocks or delays the rest of the flow.
+    const productNamesJoined = products.map(li => li.name).join(', ');
+    sendOrderConfirmation(phone, name, productNamesJoined, totalAmt, pendingOrder.order_name).then(sent => {
+      if (!sent) console.error('order_confirmation send failed for', phone);
+    });
 
     const existing     = db.prepare('SELECT * FROM customers WHERE phone = ? ORDER BY created_at DESC LIMIT 1').get(normalizePhone(phone));
     const renewalCount = existing ? existing.renewal_count + 1 : 1;
@@ -974,6 +1086,29 @@ bot.on('message', (msg) => {
 // =============================================================
 //  SCHEDULED TASKS
 // =============================================================
+
+// Payment pending notice - checks every 15 min for orders unpaid for 1+ hour,
+// sends the WhatsApp notice once per order (tracked via pending_notice_sent).
+cron.schedule('*/15 * * * *', async () => {
+  try {
+    const rows = db.prepare(`
+      SELECT * FROM pending_orders
+      WHERE paid = 0 AND cancelled = 0 AND pending_notice_sent = 0
+        AND datetime(created_at, '+1 hours') <= datetime('now')
+    `).all();
+
+    for (const order of rows) {
+      let products = [];
+      try { products = JSON.parse(order.products || '[]'); } catch(e) {}
+      const productNames = products.length ? products.map(p => p.name).join(', ') : 'Unknown Product';
+
+      sendPaymentPendingNotice(order.phone, order.name, productNames, order.order_name).then(sent => {
+        if (!sent) console.error('payment_pending_notice send failed for', order.phone);
+      });
+      db.prepare('UPDATE pending_orders SET pending_notice_sent = 1 WHERE id = ?').run(order.id);
+    }
+  } catch(e) { console.error('Payment pending notice cron error:', e.message); }
+});
 
 
 
