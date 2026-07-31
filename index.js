@@ -96,22 +96,6 @@ db.exec(`
 //  SMS MESSAGES
 // =============================================================
 
-const SMS_MSG1 = (product) =>
-  `প্রিয় গ্রাহক,\n\nআপনার ${product} সাবস্ক্রিপশনটি আগামীকাল মেয়াদ শেষ হয়ে যাবে।\n\nসার্ভিস বন্ধ হওয়ার আগেই রিনিউ করুন এবং বিরতিহীন বিনোদন উপভোগ করতে থাকুন।\n\nরিনিউ করতে যোগাযোগ করুন:\n📲 WhatsApp: wa.me/+8801928382918\n\nঅথবা সরাসরি অর্ডার করুন:\n🌐 fanflixbd.com\n\n— FanFlix BD`;
-
-
-
-
-// SMS time restriction: only send between 11 AM - 12:10 AM BD time
-function canSendSMS() {
-  const now  = new Date();
-  const hour = now.getHours();
-  const min  = now.getMinutes();
-  if (hour >= 11 && hour <= 23) return true;
-  if (hour === 0 && min <= 10) return true;
-  return false;
-}
-
 // =============================================================
 //  TELEGRAM
 // =============================================================
@@ -287,30 +271,6 @@ function getProductNames(productsJson) {
   } catch(e) { return 'Unknown'; }
 }
 
-// =============================================================
-//  SMS SENDER
-// =============================================================
-
-async function sendSMS(phone, message) {
-  if (!canSendSMS()) {
-    console.log(`SMS blocked (outside hours) to ${phone}`);
-    return;
-  }
-  const smsUrl = 'https://bulksmsbd.net/api/smsapi';
-  validateDomain(smsUrl);
-  const number = '880' + normalizePhone(phone);
-  await axios.post(smsUrl, null, {
-    params: { api_key: config.SMS_API_KEY, senderid: config.SMS_SENDER_ID, number, message }
-  });
-  // Check balance after every SMS — alert if under 100tk
-  try {
-    const balRes  = await axios.get('https://bulksmsbd.net/api/getBalanceApi', { params: { api_key: config.SMS_API_KEY } });
-    const balance = parseFloat(balRes.data?.balance || balRes.data?.data?.balance || 0);
-    if (balance < 100) {
-      await safeSend(`⚠️ *Low SMS Balance!*\nRemaining: ৳${balance}\nTop up now to avoid missed reminders!`);
-    }
-  } catch(e) { console.error('Balance check:', e.message); }
-}
 
 // =============================================================
 //  RESPOND.IO — WHATSAPP TEMPLATE MESSAGES
@@ -413,6 +373,22 @@ async function sendPaymentPendingNotice(phone, customerName, product, orderId) {
         { type: 'text', text: orderId },
       ],
     },
+  ]);
+}
+
+// universal_renewal_notice - approved template, 2 days before expiry, any product
+async function sendUniversalRenewalNotice(phone, customerName, product, daysLeft) {
+  return sendWhatsAppTemplate(phone, customerName, 'universal_renewal_notice', [
+    { type: 'header', format: 'text', text: 'Account Status Update', parameters: [] },
+    {
+      type: 'body',
+      text: 'This is an automated notice regarding your {{1}} account. Your current service period ends in {{2}} day(s). Please reply this text to manage your renewal.',
+      parameters: [
+        { type: 'text', text: product },
+        { type: 'text', text: String(daysLeft) },
+      ],
+    },
+    { type: 'footer', text: 'Thank you for choosing FanFlix BD!', parameters: [] },
   ]);
 }
 
@@ -1123,13 +1099,15 @@ cron.schedule('*/15 * * * *', async () => {
 
 cron.schedule('30 21 * * *', async () => {
   const todayStr = today();
+  const in2days  = addDaysStr(todayStr, 2);
   const in1day   = addDaysStr(todayStr, 1);
   const lost3ago = addDaysStr(todayStr, -config.LOST_ALERT_DAYS_AFTER_EXPIRY);
 
-  // Exclude Netflix/Combo products - household system now owns their reminders.
-  // Also defensively join against payments/pending_orders to ensure only genuinely
-  // paid customers ever get a reminder, even if a stray unpaid row ever exists.
-  const in1 = db.prepare(`
+  // WhatsApp renewal reminder (universal_renewal_notice) - 2 days before expiry,
+  // matching household's timing exactly. Replaces the old SMS-based reminder
+  // entirely - no more BulkSMS for renewals, WhatsApp only from here on.
+  // Excludes Netflix/Combo products - household system owns those reminders.
+  const in2 = db.prepare(`
     SELECT * FROM customers
     WHERE expiry_date = ?
       AND reminder_1_sent = 0
@@ -1139,18 +1117,20 @@ cron.schedule('30 21 * * *', async () => {
         SELECT 1 FROM pending_orders po
         WHERE po.shopify_order_id = customers.order_id AND po.paid = 1
       )
-  `).all(in1day);
-  for (const c of in1) {
+  `).all(in2days);
+  for (const c of in2) {
     try {
-      await sendSMS(c.phone, SMS_MSG1(c.product));
+      sendUniversalRenewalNotice(c.phone, c.name, c.product, 2).then(sent => {
+        if (!sent) console.error('universal_renewal_notice send failed for', c.phone);
+      });
       db.prepare('UPDATE customers SET reminder_1_sent=1 WHERE id=?').run(c.id);
       await safeSend(
-        `🚨 *Renewal SMS Sent (1 day)*\n` +
+        `🚨 *Renewal Reminder Sent (WhatsApp, 2 days)*\n` +
         `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
         `📦 ${c.product}\n` +
-        `📅 Expires: TOMORROW`
+        `📅 Expires in 2 days`
       );
-    } catch(e) { console.error('SMS 1d:', e.message); }
+    } catch(e) { console.error('Renewal reminder 2d:', e.message); }
   }
 
   const lost = db.prepare(`SELECT * FROM customers WHERE expiry_date = ? AND lost_alert_sent = 0`).all(lost3ago);
