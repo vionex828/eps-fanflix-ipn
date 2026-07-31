@@ -16,10 +16,6 @@ module.exports = {
   SHOPIFY_CLIENT_ID:     process.env.SHOPIFY_CLIENT_ID     || 'YOUR_CLIENT_ID',
   SHOPIFY_CLIENT_SECRET: process.env.SHOPIFY_CLIENT_SECRET || 'YOUR_CLIENT_SECRET',
 
-  // BULKSMSBD
-  SMS_API_KEY:   process.env.SMS_API_KEY   || 'YOUR_BULKSMSBD_API_KEY',
-  SMS_SENDER_ID: process.env.SMS_SENDER_ID || 'FanFlix',
-
   // FANFLIX HOUSEHOLD — auto-create link after payment
   FANFLIX_HOUSEHOLD_URL:  process.env.FANFLIX_HOUSEHOLD_URL  || 'https://household.fanflixbd.com',
   FANFLIX_ADMIN_SECRET:   process.env.FANFLIX_ADMIN_SECRET   || '@Orsha420@',
@@ -30,7 +26,6 @@ module.exports = {
 
   // WHITELISTED DOMAINS
   WHITELISTED_DOMAINS: [
-    'bulksmsbd.net',            // BulkSMSBD — SMS delivery API
     'eps.com.bd',               // EPS — payment gateway
     'household.fanflixbd.com',  // FanFlix household server
     'respond.io',               // Respond.io — WhatsApp template messages
