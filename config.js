@@ -24,11 +24,16 @@ module.exports = {
   FANFLIX_HOUSEHOLD_URL:  process.env.FANFLIX_HOUSEHOLD_URL  || 'https://household.fanflixbd.com',
   FANFLIX_ADMIN_SECRET:   process.env.FANFLIX_ADMIN_SECRET   || '@Orsha420@',
 
+  // RESPOND.IO — WhatsApp template messages (order confirmation, payment pending)
+  RESPONDIO_API_KEY: process.env.RESPONDIO_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MzMzNjQsInNwYWNlSWQiOjM1MjU5OCwib3JnSWQiOjM0NzU3MywidHlwZSI6ImFwaSIsImlhdCI6MTc4NTQxMTk5M30.K1MNnRwqq2kZDdW8lg-EXH1vLEc8p_yTYNKr_uEWVF4',
+  RESPONDIO_CHANNEL_ID: 442671,
+
   // WHITELISTED DOMAINS
   WHITELISTED_DOMAINS: [
     'bulksmsbd.net',            // BulkSMSBD — SMS delivery API
     'eps.com.bd',               // EPS — payment gateway
     'household.fanflixbd.com',  // FanFlix household server
+    'respond.io',               // Respond.io — WhatsApp template messages
   ],
 
   // EPS Payment Link
