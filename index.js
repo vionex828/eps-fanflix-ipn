@@ -1107,9 +1107,15 @@ cron.schedule('30 21 * * *', async () => {
   // matching household's timing exactly. Replaces the old SMS-based reminder
   // entirely - no more BulkSMS for renewals, WhatsApp only from here on.
   // Excludes Netflix/Combo products - household system owns those reminders.
+  // WhatsApp renewal reminder (universal_renewal_notice) - within 2 days of expiry,
+  // matching household's timing exactly. Uses a RANGE check (not exact-date match) -
+  // self-heals if this cron misses a run (e.g. deploy/restart near 9:30 PM), since
+  // any customer still within the window gets caught on the next run instead of
+  // being permanently skipped.
+  // Excludes Netflix/Combo products - household system owns those reminders.
   const in2 = db.prepare(`
     SELECT * FROM customers
-    WHERE expiry_date = ?
+    WHERE expiry_date >= ? AND expiry_date <= ?
       AND reminder_1_sent = 0
       AND LOWER(product) NOT LIKE '%netflix%'
       AND LOWER(product) NOT LIKE '%combo%'
@@ -1117,19 +1123,23 @@ cron.schedule('30 21 * * *', async () => {
         SELECT 1 FROM pending_orders po
         WHERE po.shopify_order_id = customers.order_id AND po.paid = 1
       )
-  `).all(in2days);
+  `).all(todayStr, in2days);
   for (const c of in2) {
     try {
-      sendUniversalRenewalNotice(c.phone, c.name, c.product, 2).then(sent => {
+      const daysLeft = Math.max(1, Math.ceil((new Date(c.expiry_date) - new Date(todayStr)) / (24*60*60*1000)));
+      sendUniversalRenewalNotice(c.phone, c.name, c.product, daysLeft).then(sent => {
         if (!sent) console.error('universal_renewal_notice send failed for', c.phone);
       });
       db.prepare('UPDATE customers SET reminder_1_sent=1 WHERE id=?').run(c.id);
       await safeSend(
-        `🚨 *Renewal Reminder Sent (WhatsApp, 2 days)*\n` +
+        `🚨 *Renewal Reminder Sent (WhatsApp, ${daysLeft}d)*\n` +
         `👤 ${cleanText(c.name)} | 📱 0${c.phone}\n` +
         `📦 ${c.product}\n` +
-        `📅 Expires in 2 days`
+        `📅 Expires in ${daysLeft} day(s)`
       );
+      // 15s gap between each customer - avoids firing many simultaneous requests
+      // at Respond.io, which was causing more "queued" (449) responses.
+      await new Promise(r => setTimeout(r, 15000));
     } catch(e) { console.error('Renewal reminder 2d:', e.message); }
   }
 
