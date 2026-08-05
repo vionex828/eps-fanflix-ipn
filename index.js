@@ -708,6 +708,55 @@ app.post('/eps-ipn', async (req, res) => {
     }
     // ─────────────────────────────────────────────────────────
 
+    // ── STREAMING PRODUCTS (Prime / HBO / Disney+ / ChatGPT) ──
+    // Combo also triggers Prime here (Combo = Netflix + Prime both).
+    // Netflix itself is handled above; these are the other products.
+    if (config.FANFLIX_HOUSEHOLD_URL && config.FANFLIX_ADMIN_SECRET) {
+      const STREAM_MATCH = [
+        { type: 'prime',   test: n => n.includes('prime') || n.includes('combo') },
+        { type: 'hbo',     test: n => n.includes('hbo') },
+        { type: 'disney',  test: n => n.includes('disney') },
+        { type: 'chatgpt', test: n => n.includes('chatgpt') || n.includes('chat gpt') },
+      ];
+
+      for (const sm of STREAM_MATCH) {
+        const matchedProduct = products.find(li => sm.test((li.name || '').toLowerCase()));
+        if (!matchedProduct) continue;
+
+        try {
+          const days = parseDuration(matchedProduct.variant || matchedProduct.name || '');
+          const res = await axios.post(
+            config.FANFLIX_HOUSEHOLD_URL + '/api/streaming/auto-create',
+            {
+              secret: config.FANFLIX_ADMIN_SECRET,
+              type: sm.type,
+              phone: phone,
+              customerName: name,
+              days: days,
+              orderName: pendingOrder.order_name,
+              amount: totalAmt,
+              product: matchedProduct.name,
+            },
+            { timeout: 60000, validateStatus: (s) => s < 600 }
+          );
+
+          if (res.data?.success && res.data?.delivered) {
+            await safeSend(`✅ *${sm.type.toUpperCase()} Auto-Delivered!*\n👤 ${cleanText(name)} | 📱 ${phone}\n📦 ${matchedProduct.name}\n⏳ ${days} days\n📲 Sent via WhatsApp`);
+          } else if (res.data?.renewed) {
+            await safeSend(`🔄 *${sm.type.toUpperCase()} Renewed!*\n👤 ${cleanText(name)} | 📱 ${phone}\n⏳ +${days} days`);
+          } else if (res.data?.waitlisted) {
+            await safeSend(`🚨 *${sm.type.toUpperCase()} STOCK OUT!*\n👤 ${cleanText(name)} | 📱 ${phone}\n📦 ${matchedProduct.name} | ${days} days\n💰 ৳${totalAmt}\n⚠️ Add ${sm.type} accounts in admin panel!`);
+          } else {
+            await safeSend(`⚠️ *${sm.type.toUpperCase()} Delivery Failed!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${res.data?.error || 'Unknown'}\nDeliver manually.`);
+          }
+        } catch(e) {
+          console.error(`${sm.type} auto-create error:`, e.message);
+          await safeSend(`⚠️ *${sm.type.toUpperCase()} Auto-Create Error!*\n👤 ${cleanText(name)} | 📱 ${phone}\nError: ${e.message}\nDeliver manually.`);
+        }
+      }
+    }
+    // ─────────────────────────────
+
   } catch(err) {
     console.error('IPN Error:', err.message);
     safeSend(`❌ Bot Error: ${err.message}`).catch(() => {});
